@@ -1,0 +1,1213 @@
+Keep Copilot Chat BYOK execution owned by the remote/server Agent Host so an
+active turn can continue while the browser is inactive, reloaded, or closed.
+Direct-capable BYOK provider descriptors are handed to Agent Host memory only;
+unsupported provider shapes retain the upstream renderer bridge fallback.
+
+Security: syncEphemeralByokModels can carry credentials. AhpJsonlLogger redacts
+that notification before JSONL serialization and records counts only. The
+sentinel regression test must remain green so keys, headers, bearer tokens, and
+private endpoints never enter AHP transport logs.
+
+Reproduction: start a long-running BYOK Agent Host turn, then make the renderer
+inactive, hard-reload it, and fully close it. The same turn must continue on the
+server without a new user message and reconnect to the same progressed session.
+
+diff --git code-server.orig/lib/vscode/src/vs/platform/agentHost/browser/agentHostProtocolClient.ts code-server/lib/vscode/src/vs/platform/agentHost/browser/agentHostProtocolClient.ts
+index 13c43541aad..9b864ba95fe 100644
+--- code-server.orig/lib/vscode/src/vs/platform/agentHost/browser/agentHostProtocolClient.ts
++++ code-server/lib/vscode/src/vs/platform/agentHost/browser/agentHostProtocolClient.ts
+@@ -48,6 +48,7 @@ import { getTelemetryLevel } from '../../telemetry/common/telemetryUtils.js';
+ import { AgentHostAutoApprovePolicyRestrictedConfigKey, AgentHostTelemetryLevelConfigKey, AgentHostTerminalAutoApproveEnabledConfigKey, AgentHostTerminalAutoApproveRulesConfigKey, AgentHostDisableRepoInfoTelemetryConfigKey, AgentHostWorkspaceTrustConfigKey, getAgentHostTerminalAutoApproveRulesConfig, GLOBAL_AUTO_APPROVE_SETTING_ID, TERMINAL_AUTO_APPROVE_ENABLED_SETTING_ID, TERMINAL_AUTO_APPROVE_SETTING_ID, TERMINAL_IGNORE_DEFAULT_AUTO_APPROVE_RULES_SETTING_ID, DISABLE_REPO_INFO_TELEMETRY_SETTING_ID, telemetryLevelToAgentHostConfigValue } from '../common/agentHostSchema.js';
+ import { formatAgentHostConfigurationSyncValueForLog, getAgentHostConfigurationSyncEntries, getAgentHostConfigurationSyncTarget, resolveAgentHostConfigurationSyncPatch, resolveAgentHostConfigurationSyncValue } from '../common/agentHostConfigurationSync.js';
+ import { managedPermissionsConfigurationIds, resolveManagedSettingsPermissions, type IAgentHostManagedSettingsPermissions } from '../common/agentHostManagedSettings.js';
++import type { IByokLmModelInfo } from '../common/agentHostByokLm.js';
+ import { AgentHostClientConnectionKind, toAgentHostClientMeta } from '../common/agentHostTelemetry.js';
+ import type { OtlpExportLogsParams } from '../common/state/protocol/channels-otlp/notifications.js';
+ import type { TelemetryCapabilities } from '../common/state/protocol/channels-otlp/state.js';
+@@ -118,6 +119,7 @@ function isConnectionClosedError(error: unknown): boolean {
+ 
+ interface IRemoteAgentHostExtensionNotificationMap {
+ 	'setClientManagedSettingsPermissions': { params: { permissions: IAgentHostManagedSettingsPermissions } };
++	'syncEphemeralByokModels': { params: { channel: typeof ROOT_STATE_URI; models: readonly IByokLmModelInfo[] } };
+ }
+ 
+ interface IPendingRequest {
+@@ -1393,6 +1395,10 @@ export class AgentHostProtocolClient extends Disposable implements IAgentConnect
+ 		return this._subscriptionManager.getActiveSubscriptions();
+ 	}
+ 
++	syncEphemeralByokModels(models: readonly IByokLmModelInfo[]): void {
++		this._sendExtensionNotification('syncEphemeralByokModels', { channel: ROOT_STATE_URI, models }, true);
++	}
++
+ 	dispatch(channel: string, action: SessionAction | ChatAction | TerminalAction | ClientChangesetAction | ClientAnnotationsAction | ClientAutomationAction | ClientAutomationRunAction | IRootConfigChangedAction): void {
+ 		const seq = this._subscriptionManager.dispatchOptimistic(channel, action);
+ 		this.dispatchAction(channel, action, this._clientId, seq);
+diff --git code-server.orig/lib/vscode/src/vs/platform/agentHost/common/agentHostByokLm.ts code-server/lib/vscode/src/vs/platform/agentHost/common/agentHostByokLm.ts
+index fef22bec3b8..87803046098 100644
+--- code-server.orig/lib/vscode/src/vs/platform/agentHost/common/agentHostByokLm.ts
++++ code-server/lib/vscode/src/vs/platform/agentHost/common/agentHostByokLm.ts
+@@ -135,6 +135,20 @@ export interface IByokLmChatResult {
+  * Metadata for a renderer BYOK model, enumerated over the bridge so the node
+  * agent host can advertise it to the SDK runtime without any host-side config.
+  */
++export interface IByokLmDirectProviderConfig {
++	/** Synthetic SDK provider name. Unique per endpoint/configuration so credentials never cross provider groups. */
++	readonly name: string;
++	readonly type: 'openai' | 'azure' | 'anthropic';
++	readonly wireApi?: 'completions' | 'responses';
++	readonly baseUrl: string;
++	readonly apiKey?: string;
++	readonly bearerToken?: string;
++	readonly headers?: Readonly<Record<string, string>>;
++	readonly azure?: { readonly apiVersion?: string };
++	/** Provider-local model id handed to the SDK. */
++	readonly modelId: string;
++}
++
+ export interface IByokLmModelInfo {
+ 	/** Provider/vendor name (the LM API vendor that registered the model). */
+ 	readonly vendor: string;
+@@ -161,6 +175,11 @@ export interface IByokLmModelInfo {
+ 	readonly supportedReasoningEfforts?: readonly string[];
+ 	/** Default reasoning effort advertised by the renderer model, when known. */
+ 	readonly defaultReasoningEffort?: string;
++	/**
++	 * Optional direct provider configuration. This is ephemeral credential material:
++	 * it must stay in process memory and must never be persisted in agent-host state.
++	 */
++	readonly directProvider?: IByokLmDirectProviderConfig;
+ }
+ 
+ /**
+@@ -177,7 +196,9 @@ export function getByokLmSelectionModelId(model: IByokLmModelInfo): string {
+ 
+ /** Returns the provider-qualified model id advertised by the agent host. */
+ export function getByokLmAgentModelId(model: IByokLmModelInfo): string {
+-	return `${model.vendor}/${getByokLmSelectionModelId(model)}`;
++	return model.directProvider
++		? `${model.directProvider.name}/${model.directProvider.modelId}`
++		: `${model.vendor}/${getByokLmSelectionModelId(model)}`;
+ }
+ 
+ /** Resolves BYOK enablement and trace context from synchronized root configuration. */
+diff --git code-server.orig/lib/vscode/src/vs/platform/agentHost/common/agentHostEnablementService.ts code-server/lib/vscode/src/vs/platform/agentHost/common/agentHostEnablementService.ts
+index 7e980cedd5f..bb5340b6b0e 100644
+--- code-server.orig/lib/vscode/src/vs/platform/agentHost/common/agentHostEnablementService.ts
++++ code-server/lib/vscode/src/vs/platform/agentHost/common/agentHostEnablementService.ts
+@@ -51,9 +51,8 @@ configurationRegistry.registerConfiguration({
+ 		'chat.editor.preferCopilotHarness': {
+ 			type: 'boolean',
+ 			description: nls.localize('chat.editor.preferCopilotHarness', "When enabled, uses the Agent Host Copilot SDK whenever the local harness would otherwise be selected for a new editor chat session. Claude and Codex selections are unaffected."),
+-			default: false,
++			default: true,
+ 			tags: ['experimental'],
+-			experiment: { mode: 'startup' },
+ 			policy: {
+ 				name: 'ChatEditorPreferCopilotHarness',
+ 				category: PolicyCategory.InteractiveSession,
+@@ -69,9 +68,8 @@ configurationRegistry.registerConfiguration({
+ 		'chat.defaultToCopilotHarness': {
+ 			type: 'boolean',
+ 			description: nls.localize('chat.defaultToCopilotHarness', "When enabled, new editor and panel chat sessions default to the Agent Host Copilot SDK instead of the local harness."),
+-			default: false,
++			default: true,
+ 			tags: ['experimental'],
+-			experiment: { mode: 'startup' },
+ 		},
+ 		'chat.editor.localAgent.enabled': {
+ 			type: 'boolean',
+diff --git code-server.orig/lib/vscode/src/vs/platform/agentHost/common/agentHostStarter.config.contribution.ts code-server/lib/vscode/src/vs/platform/agentHost/common/agentHostStarter.config.contribution.ts
+index 41d798d14f3..1d7bd6987a7 100644
+--- code-server.orig/lib/vscode/src/vs/platform/agentHost/common/agentHostStarter.config.contribution.ts
++++ code-server/lib/vscode/src/vs/platform/agentHost/common/agentHostStarter.config.contribution.ts
+@@ -279,10 +279,9 @@ configurationRegistry.registerConfiguration({
+ 		[AgentHostByokModelsEnabledSettingId]: {
+ 			type: 'boolean',
+ 			description: nls.localize('chat.agentHost.byokModels.enabled', "When enabled, extension-provided BYOK ('bring your own key') models can run in agent-host sessions. Changes are synchronized to the running agent host and do not require a restart."),
+-			default: false,
++			default: true,
+ 			tags: ['experimental', 'advanced'],
+-			experiment: { mode: 'startup' },
+-			agentHost: { key: AgentHostByokModelsEnabledConfigKey, scope: AgentHostConfigurationSyncScope.Local },
++			agentHost: { key: AgentHostByokModelsEnabledConfigKey, scope: AgentHostConfigurationSyncScope.Ambient },
+ 		},
+ 		[AgentHostCodexAgentEnabledSettingId]: {
+ 			type: 'boolean',
+diff --git code-server.orig/lib/vscode/src/vs/platform/agentHost/common/agentService.ts code-server/lib/vscode/src/vs/platform/agentHost/common/agentService.ts
+index a4018fe52b2..45f028e9517 100644
+--- code-server.orig/lib/vscode/src/vs/platform/agentHost/common/agentService.ts
++++ code-server/lib/vscode/src/vs/platform/agentHost/common/agentService.ts
+@@ -13,6 +13,7 @@ import { isWindows } from '../../../base/common/platform.js';
+ import { URI } from '../../../base/common/uri.js';
+ import type { IConfigurationChangeEvent, IConfigurationService } from '../../configuration/common/configuration.js';
+ import { createDecorator } from '../../instantiation/common/instantiation.js';
++import type { IByokLmModelInfo } from './agentHostByokLm.js';
+ import { AgentSandboxSettingId } from '../../sandbox/common/settings.js';
+ import type { IActiveSubscriptionInfo, IAgentSubscription } from './state/agentSubscription.js';
+ import type { IRemoteWatchHandle } from './agentHostFileSystemProvider.js';
+@@ -1017,6 +1018,9 @@ export interface IAgentService {
+ 	 */
+ 	dispatchAction(channel: string, action: SessionAction | ChatAction | TerminalAction | ClientChangesetAction | ClientAnnotationsAction | IRootConfigChangedAction | ClientAutomationAction | ClientAutomationRunAction, clientId: string, clientSeq: number, clientContext?: IAgentHostClientTelemetryContext): void;
+ 
++	/** Replace the process-memory-only direct BYOK snapshot; remote-host extension only. */
++	syncEphemeralByokModels?(models: readonly IByokLmModelInfo[]): void;
++
+ 	/**
+ 	 * List the contents of a directory on the agent host's filesystem.
+ 	 * Used by the client to drive a remote folder picker before session creation.
+@@ -1291,6 +1295,12 @@ export interface IAgentHostService extends IAgentConnection {
+ 	/** Start connecting to the agent host if it has not already started. */
+ 	startAgentHost(): void;
+ 
++	/**
++	 * Push a process-memory-only BYOK model snapshot to a remote agent host.
++	 * Implemented only by remote clients; credentials are never persisted in host state.
++	 */
++	syncEphemeralByokModels?(models: readonly IByokLmModelInfo[]): void;
++
+ 	/** Restart the agent host process, if this connection owns its lifecycle. */
+ 	restartAgentHost(): Promise<void>;
+ 
+diff --git code-server.orig/lib/vscode/src/vs/platform/agentHost/common/ahpJsonlLogger.ts code-server/lib/vscode/src/vs/platform/agentHost/common/ahpJsonlLogger.ts
+index 4da07af23c9..07a80dc086c 100644
+--- code-server.orig/lib/vscode/src/vs/platform/agentHost/common/ahpJsonlLogger.ts
++++ code-server/lib/vscode/src/vs/platform/agentHost/common/ahpJsonlLogger.ts
+@@ -99,7 +99,7 @@ export class AhpJsonlLogger extends Disposable {
+ 			transport: this._options.transport,
+ 			...(typeof byteLength === 'number' ? { byteLength } : {}),
+ 		};
+-		const entry = { ...message, _ahpLog: meta };
++		const entry = { ...redactSensitiveAhpMessage(message), _ahpLog: meta };
+ 		// Fast path: serialize once. The vast majority of messages are small, so
+ 		// we only pay a single stringify and use its length to decide whether the
+ 		// rare oversized-message path below is needed.
+@@ -213,6 +213,38 @@ export class AhpJsonlLogger extends Disposable {
+ 	}
+ }
+ 
++function redactSensitiveAhpMessage(message: object): object {
++	const candidate = message as { readonly method?: unknown; readonly params?: unknown };
++	if (candidate.method !== 'syncEphemeralByokModels') {
++		return message;
++	}
++
++	const params = candidate.params;
++	if (!params || typeof params !== 'object') {
++		return { ...message, params: { redacted: true } };
++	}
++
++	const typedParams = params as { readonly channel?: unknown; readonly models?: unknown };
++	const models = Array.isArray(typedParams.models) ? typedParams.models : [];
++	let directModelCount = 0;
++	for (const model of models) {
++		if (model && typeof model === 'object' && (model as { readonly directProvider?: unknown }).directProvider) {
++			directModelCount++;
++		}
++	}
++
++	return {
++		...message,
++		params: {
++			...(typeof typedParams.channel === 'string' ? { channel: typedParams.channel } : {}),
++			redacted: true,
++			modelCount: models.length,
++			directModelCount,
++			bridgedModelCount: models.length - directModelCount,
++		},
++	};
++}
++
+ export function getAhpLogByteLength(text: string): number {
+ 	return VSBuffer.fromString(text).byteLength;
+ }
+diff --git code-server.orig/lib/vscode/src/vs/platform/agentHost/node/agentHostServerMain.ts code-server/lib/vscode/src/vs/platform/agentHost/node/agentHostServerMain.ts
+index 3d088613b98..b5c98d76e55 100644
+--- code-server.orig/lib/vscode/src/vs/platform/agentHost/node/agentHostServerMain.ts
++++ code-server/lib/vscode/src/vs/platform/agentHost/node/agentHostServerMain.ts
+@@ -32,6 +32,7 @@ import { IProductService } from '../../product/common/productService.js';
+ import { shutdownAgentHostBeforeDispose } from './agentHostShutdown.js';
+ import { ITelemetryService } from '../../telemetry/common/telemetry.js';
+ import { createAgentHostRuntime } from './agentHostBootstrap.js';
++import { ByokLmBridgeRegistry } from './byokLmBridgeRegistry.js';
+ import { IAgentConfigurationService } from './agentConfigurationService.js';
+ import { IAgentHostCompletions } from './agentHostCompletions.js';
+ import { IAgentHostCustomizationEnablementService } from './agentHostCustomizationEnablementService.js';
+@@ -191,6 +192,7 @@ async function main(): Promise<void> {
+ 		}
+ 	}
+ 
++	const byokLmBridgeRegistry = new ByokLmBridgeRegistry();
+ 	const runtime = await createAgentHostRuntime({
+ 		environmentService,
+ 		productService,
+@@ -200,7 +202,7 @@ async function main(): Promise<void> {
+ 		transientProxyConfiguration: false,
+ 		hostLaunchKind: AgentHostLaunchKind.VSCodeCLI,
+ 		providerConfigurations: [createCodexProviderConfiguration(environmentService.userHome, process.env[AgentHostCodexAgentCodexHomeEnvVar])],
+-		byok: { kind: 'unavailable' },
++		byok: { kind: 'renderer', bridgeRegistry: byokLmBridgeRegistry },
+ 	});
+ 	disposables.add(runtime);
+ 	const { agentService, instantiationService } = runtime;
+diff --git code-server.orig/lib/vscode/src/vs/platform/agentHost/node/agentService.ts code-server/lib/vscode/src/vs/platform/agentHost/node/agentService.ts
+index d2f723b7a0d..536c5b6c147 100644
+--- code-server.orig/lib/vscode/src/vs/platform/agentHost/node/agentService.ts
++++ code-server/lib/vscode/src/vs/platform/agentHost/node/agentService.ts
+@@ -80,6 +80,8 @@ import { AgentHostCatalogDatabaseReference, AgentHostCatalogSyncService, IAgentH
+ import { AGENT_HOST_CATALOG_PAYLOAD_VERSION, AgentHostCatalogData, decodeAgentHostCatalogPayload } from './agentHostCatalogProjection.js';
+ import { AgentHostCatalogReconciliationService, AgentHostCatalogReconciliationSourceResult, AGENT_HOST_CATALOG_VERIFICATION_VERSION_STORAGE_KEY, IAgentHostCatalogReconciliationOptions } from './agentHostCatalogReconciliationService.js';
+ import { IAgentHostStorageService } from './agentHostStorageService.js';
++import { IByokLmBridgeRegistry } from './byokLmBridgeRegistry.js';
++import type { IByokLmModelInfo } from '../common/agentHostByokLm.js';
+ import { AgentHostCatalogListReader, AgentHostCatalogListResult, type AgentHostCatalogListManyResult } from './agentHostCatalogListReader.js';
+ import { AgentHostSessionsV2CandidateResolution, AgentHostSessionsV2MigrationService, IAgentHostSessionsV2Candidate, type IAgentHostSessionsV2MigrationReport } from './agentHostSessionsV2MigrationService.js';
+ 
+@@ -764,6 +766,7 @@ export class AgentService extends Disposable implements IAgentService {
+ 	 *   clients time to reconnect.
+ 	 */
+ 	private readonly _resourceWatches = this._register(new DisposableMap<string, IActiveResourceWatch>());
++	private readonly _byokLmBridgeRegistry: IByokLmBridgeRegistry;
+ 
+ 	constructor(
+ 		core: IAgentServiceCore,
+@@ -790,6 +793,7 @@ export class AgentService extends Disposable implements IAgentService {
+ 		@IAgentHostStartupPerformance private readonly _startupPerformance: IAgentHostStartupPerformance,
+ 	) {
+ 		super();
++		this._byokLmBridgeRegistry = instantiationService.invokeFunction(accessor => accessor.get(IByokLmBridgeRegistry));
+ 		this._authService = core.authenticationService;
+ 		this._orchestratorDatabase = core.orchestratorDatabase;
+ 		this._debugLogsCollector = core.debugLogsCollector;
+@@ -6677,6 +6681,10 @@ export class AgentService extends Disposable implements IAgentService {
+ 		return action.type === ActionType.AutomationRunCancelRequested;
+ 	}
+ 
++	syncEphemeralByokModels(models: readonly IByokLmModelInfo[]): void {
++		this._byokLmBridgeRegistry.setDirectModels(models);
++	}
++
+ 	dispatchAction(channel: string, action: SessionAction | ChatAction | TerminalAction | ClientChangesetAction | ClientAnnotationsAction | IRootConfigChangedAction | ClientAutomationAction | ClientAutomationRunAction, clientId: string, clientSeq: number, clientContextOrType: IAgentHostClientTelemetryContext | AgentHostClientType = AgentHostClientType.Unknown): void {
+ 		const clientContext = typeof clientContextOrType === 'string'
+ 			? createUnknownAgentHostClientTelemetryContext(clientContextOrType)
+diff --git code-server.orig/lib/vscode/src/vs/platform/agentHost/node/byokLmBridgeRegistry.ts code-server/lib/vscode/src/vs/platform/agentHost/node/byokLmBridgeRegistry.ts
+index d8797c1fce6..ba8e945cbb6 100644
+--- code-server.orig/lib/vscode/src/vs/platform/agentHost/node/byokLmBridgeRegistry.ts
++++ code-server/lib/vscode/src/vs/platform/agentHost/node/byokLmBridgeRegistry.ts
+@@ -38,6 +38,9 @@ export interface IByokLmBridgeRegistry {
+ 	/** Register a renderer connection. Disposing the result removes it. */
+ 	register(clientId: string, connection: IByokLmBridgeConnection): IDisposable;
+ 
++	/** Replace the process-memory-only direct BYOK snapshot. Survives renderer disconnects, not host restarts. */
++	setDirectModels(models: readonly IByokLmModelInfo[]): void;
++
+ 	/**
+ 	 * The serving window's BYOK models, read synchronously from the cache (no
+ 	 * enumeration). Use this for fast reads driven by {@link onDidChangeModels}.
+@@ -77,6 +80,7 @@ export class ByokLmBridgeRegistry implements IByokLmBridgeRegistry {
+ 
+ 	private readonly _entries = new Map<string, IConnectionEntry>();
+ 	private readonly _changeListeners = new Set<() => void>();
++	private _directModels: readonly IByokLmModelInfo[] = [];
+ 
+ 	onDidChangeModels(listener: () => void): IDisposable {
+ 		this._changeListeners.add(listener);
+@@ -125,8 +129,22 @@ export class ByokLmBridgeRegistry implements IByokLmBridgeRegistry {
+ 		});
+ 	}
+ 
++	setDirectModels(models: readonly IByokLmModelInfo[]): void {
++		if (!modelsEqual(this._directModels, models)) {
++			this._directModels = models;
++			this._notifyChanged();
++		}
++	}
++
+ 	getModels(): readonly IByokLmModelInfo[] {
+-		return this._servingEntry()?.models ?? [];
++		const bridged = this._servingEntry()?.models ?? [];
++		if (this._directModels.length === 0) {
++			return bridged;
++		}
++		// A renderer snapshot contains the same direct-capable models as the
++		// ephemeral snapshot. Prefer the direct copy so the catalogue exposes one
++		// entry per model; keep only renderer-only models as compatibility fallbacks.
++		return [...this._directModels, ...bridged.filter(model => !model.directProvider)];
+ 	}
+ 
+ 	getServingConnection(): IByokLmBridgeConnection | undefined {
+@@ -171,6 +189,7 @@ function modelsEqual(a: readonly IByokLmModelInfo[], b: readonly IByokLmModelInf
+ 			&& m.maxOutputTokens === n.maxOutputTokens
+ 			&& m.supportsVision === n.supportsVision
+ 			&& m.defaultReasoningEffort === n.defaultReasoningEffort
++			&& JSON.stringify(m.directProvider) === JSON.stringify(n.directProvider)
+ 			&& arraysEqual(m.supportedReasoningEfforts, n.supportedReasoningEfforts);
+ 	});
+ }
+@@ -192,6 +211,8 @@ export class NullByokLmBridgeRegistry implements IByokLmBridgeRegistry {
+ 		return Disposable.None;
+ 	}
+ 
++	setDirectModels(): void { }
++
+ 	getModels(): readonly IByokLmModelInfo[] {
+ 		return [];
+ 	}
+diff --git code-server.orig/lib/vscode/src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts code-server/lib/vscode/src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts
+index 0582691d039..cd332af0de6 100644
+--- code-server.orig/lib/vscode/src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts
++++ code-server/lib/vscode/src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts
+@@ -13,7 +13,7 @@ import { generateUuid } from '../../../../base/common/uuid.js';
+ import { IFileService } from '../../../files/common/files.js';
+ import { ILogService, LogLevel } from '../../../log/common/log.js';
+ import { AgentSession } from '../../common/agent.js';
+-import { getByokLmSelectionModelId, resolveByokLmEnablement, type IByokLmModelInfo } from '../../common/agentHostByokLm.js';
++import { getByokLmAgentModelId, getByokLmSelectionModelId, resolveByokLmEnablement, type IByokLmModelInfo } from '../../common/agentHostByokLm.js';
+ import { AgentHostByokModelsEnabledConfigKey, AgentHostMcpConnectorsEnabledConfigKey, AgentHostSessionSyncEnabledConfigKey, platformRootSchema, type AgentHostMcpServers } from '../../common/agentHostSchema.js';
+ import { CopilotCliConfigKey, copilotCliConfigSchema, normalizeModelFamilyAlias, normalizeToolSearchDeferThreshold, resolveModelCapabilityOverrideField } from '../../common/copilotCliConfig.js';
+ import { IAgentHostOTelService } from '../../common/otel/agentHostOTelService.js';
+@@ -549,60 +549,94 @@ export async function resolveByokSessionConfig(
+ 	startProxy: () => Promise<IByokLmProxyHandle>,
+ 	logService: ILogService,
+ ): Promise<{ providers?: NamedProviderConfig[]; models?: ProviderModelConfig[] }> {
+-	// Surface the serving window's BYOK models. The registry does not union
+-	// windows' model sets — all serving windows expose the same set, so it picks
+-	// one (see `IByokLmBridgeRegistry`) and the proxy routes inference there.
+ 	let byokModels: IByokLmModelInfo[];
+ 	try {
+ 		byokModels = [...bridgeRegistry.getModels()];
+ 	} catch (err) {
+-		logService.warn(`[Copilot:${sessionId}] Failed to enumerate BYOK models from renderer bridges`, err);
++		logService.warn(`[Copilot:${sessionId}] Failed to enumerate BYOK models`, err);
+ 		return {};
+ 	}
+ 	if (byokModels.length === 0) {
+ 		return {};
+ 	}
+-	// Deduplicate by group-qualified selection id (`vendor/[group/]id`). The same BYOK model can be
+-	// reported more than once — e.g. when two renderer bridges are transiently
+-	// serving during a window hand-off (continuing a chat into a new session) —
+-	// and the runtime rejects a session config with duplicate BYOK model
+-	// selection ids ("Duplicate BYOK model selection id ...").
++
++	// De-duplicate by the actual SDK selection id. Direct providers use a
++	// synthetic provider name so multiple groups of one VS Code vendor can carry
++	// different endpoints/credentials without colliding.
+ 	const seenSelectionIds = new Set<string>();
+-	byokModels = byokModels.filter(m => {
+-		const selectionId = `${m.vendor}/${getByokLmSelectionModelId(m)}`;
++	byokModels = byokModels.filter(model => {
++		const selectionId = getByokLmAgentModelId(model);
+ 		if (seenSelectionIds.has(selectionId)) {
+ 			return false;
+ 		}
+ 		seenSelectionIds.add(selectionId);
+ 		return true;
+ 	});
+-	// `startProxy` binds a local loopback listener — unlikely to fail, but it
+-	// must never break session materialization (which fires the cross-window
+-	// `sessionAdded` broadcast). Degrade to no BYOK config on failure.
+-	let handle: IByokLmProxyHandle;
+-	try {
+-		handle = await startProxy();
+-	} catch (err) {
+-		logService.warn(`[Copilot:${sessionId}] Failed to start BYOK loopback proxy`, err);
+-		return {};
++
++	const providers: NamedProviderConfig[] = [];
++	const models: ProviderModelConfig[] = [];
++	const directProviderNames = new Set<string>();
++	const bridgedModels: IByokLmModelInfo[] = [];
++
++	for (const model of byokModels) {
++		const direct = model.directProvider;
++		if (!direct) {
++			bridgedModels.push(model);
++			continue;
++		}
++		if (!directProviderNames.has(direct.name)) {
++			directProviderNames.add(direct.name);
++			providers.push({
++				name: direct.name,
++				type: direct.type,
++				...(direct.wireApi ? { wireApi: direct.wireApi } : {}),
++				baseUrl: direct.baseUrl,
++				...(direct.apiKey !== undefined ? { apiKey: direct.apiKey } : {}),
++				...(direct.bearerToken !== undefined ? { bearerToken: direct.bearerToken } : {}),
++				...(direct.headers ? { headers: { ...direct.headers } } : {}),
++				...(direct.azure ? { azure: { ...direct.azure } } : {}),
++			});
++		}
++		models.push({
++			id: direct.modelId,
++			provider: direct.name,
++			...(model.name !== undefined ? { name: model.name } : {}),
++			...(model.maxContextWindowTokens !== undefined ? { maxContextWindowTokens: model.maxContextWindowTokens } : {}),
++			...(model.maxPromptTokens !== undefined ? { maxPromptTokens: model.maxPromptTokens } : {}),
++			...(model.maxOutputTokens !== undefined ? { maxOutputTokens: model.maxOutputTokens } : {}),
++		});
+ 	}
+-	const providers: NamedProviderConfig[] = [...new Set(byokModels.map(m => m.vendor))].map(vendor => ({
+-		name: vendor,
+-		type: 'openai',
+-		wireApi: 'responses',
+-		baseUrl: handle.providerBaseUrl(vendor),
+-		bearerToken: `${handle.nonce}.${sessionId}`,
+-	}));
+-	const models: ProviderModelConfig[] = byokModels.map(m => ({
+-		id: getByokLmSelectionModelId(m),
+-		provider: m.vendor,
+-		...(m.name !== undefined ? { name: m.name } : {}),
+-		...(m.maxContextWindowTokens !== undefined ? { maxContextWindowTokens: m.maxContextWindowTokens } : {}),
+-		...(m.maxPromptTokens !== undefined ? { maxPromptTokens: m.maxPromptTokens } : {}),
+-		...(m.maxOutputTokens !== undefined ? { maxOutputTokens: m.maxOutputTokens } : {}),
+-	}));
+-	logService.info(`[Copilot:${sessionId}] Wired ${models.length} BYOK model(s) across ${providers.length} provider(s) via loopback proxy ${handle.baseUrl}`);
+-	return { providers, models };
++
++	// Keep the upstream renderer bridge as a compatibility fallback for BYOK
++	// providers that cannot be represented safely as a direct SDK provider.
++	if (bridgedModels.length > 0) {
++		let handle: IByokLmProxyHandle;
++		try {
++			handle = await startProxy();
++		} catch (err) {
++			logService.warn(`[Copilot:${sessionId}] Failed to start BYOK loopback proxy`, err);
++			return providers.length || models.length ? { providers, models } : {};
++		}
++		const vendors = [...new Set(bridgedModels.map(model => model.vendor))];
++		providers.push(...vendors.map(vendor => ({
++			name: vendor,
++			type: 'openai' as const,
++			wireApi: 'responses' as const,
++			baseUrl: handle.providerBaseUrl(vendor),
++			bearerToken: `${handle.nonce}.${sessionId}`,
++		})));
++		models.push(...bridgedModels.map(model => ({
++			id: getByokLmSelectionModelId(model),
++			provider: model.vendor,
++			...(model.name !== undefined ? { name: model.name } : {}),
++			...(model.maxContextWindowTokens !== undefined ? { maxContextWindowTokens: model.maxContextWindowTokens } : {}),
++			...(model.maxPromptTokens !== undefined ? { maxPromptTokens: model.maxPromptTokens } : {}),
++			...(model.maxOutputTokens !== undefined ? { maxOutputTokens: model.maxOutputTokens } : {}),
++		})));
++	}
++
++	logService.info(`[Copilot:${sessionId}] Wired ${models.length} BYOK model(s): ${directProviderNames.size} direct provider(s), ${bridgedModels.length} renderer-bridged model(s)`);
++	return providers.length || models.length ? { providers, models } : {};
+ }
+ 
+ /** Applies sandbox configuration, returning false when the runtime retains its policy after a managed conflict. */
+diff --git code-server.orig/lib/vscode/src/vs/platform/agentHost/node/protocolServerHandler.ts code-server/lib/vscode/src/vs/platform/agentHost/node/protocolServerHandler.ts
+index 8f6466a1ef8..9c009a7c41c 100644
+--- code-server.orig/lib/vscode/src/vs/platform/agentHost/node/protocolServerHandler.ts
++++ code-server/lib/vscode/src/vs/platform/agentHost/node/protocolServerHandler.ts
+@@ -18,6 +18,7 @@ import { AHPFileSystemProvider } from '../common/agentHostFileSystemProvider.js'
+ import { getAgentHostClientType } from '../common/agentHostClientInfo.js';
+ import { AgentHostClientConnectionKind, AgentHostLaunchKind, AgentHostTransportKind, readClientConnectionKind, readClientDevDeviceId, readClientMachineId, readClientTelemetryLevel, type IAgentHostClientTelemetryContext } from '../common/agentHostTelemetry.js';
+ import { AgentSession, type IAgentCreateChatRequestOptions, type IMcpNotification } from '../common/agent.js';
++import type { IByokLmModelInfo } from '../common/agentHostByokLm.js';
+ import { isManagedSettingsPermissions } from '../common/agentHostManagedSettings.js';
+ import { isAnnotationsUri } from '../common/annotationsUri.js';
+ import { parseChangesetUri } from '../common/changesetUri.js';
+@@ -145,6 +146,55 @@ function readMcpChannel(params: unknown): string | undefined {
+ 	return channel;
+ }
+ 
++const MAX_EPHEMERAL_BYOK_MODELS = 256;
++const MAX_EPHEMERAL_BYOK_STRING = 16 * 1024;
++
++function isBoundedString(value: unknown, optional = false): value is string | undefined {
++	return (optional && value === undefined) || (typeof value === 'string' && value.length <= MAX_EPHEMERAL_BYOK_STRING);
++}
++
++function isStringRecord(value: unknown): value is Readonly<Record<string, string>> {
++	return typeof value === 'object' && value !== null && !Array.isArray(value)
++		&& Object.entries(value).every(([key, entry]) => key.length <= 1024 && isBoundedString(entry));
++}
++
++/** Validate the private, credential-bearing BYOK handoff before it reaches host memory. */
++function isEphemeralByokModelList(value: unknown): value is readonly IByokLmModelInfo[] {
++	if (!Array.isArray(value) || value.length > MAX_EPHEMERAL_BYOK_MODELS) {
++		return false;
++	}
++	return value.every(model => {
++		if (typeof model !== 'object' || model === null || Array.isArray(model)) {
++			return false;
++		}
++		const candidate = model as Record<string, unknown>;
++		if (!isBoundedString(candidate.vendor) || !isBoundedString(candidate.id)) {
++			return false;
++		}
++		const direct = candidate.directProvider;
++		if (typeof direct !== 'object' || direct === null || Array.isArray(direct)) {
++			return false;
++		}
++		const provider = direct as Record<string, unknown>;
++		if (!isBoundedString(provider.name) || !isBoundedString(provider.baseUrl) || !isBoundedString(provider.modelId)) {
++			return false;
++		}
++		if (!['openai', 'azure', 'anthropic'].includes(String(provider.type))) {
++			return false;
++		}
++		if (provider.wireApi !== undefined && !['completions', 'responses'].includes(String(provider.wireApi))) {
++			return false;
++		}
++		if (!isBoundedString(provider.apiKey, true) || !isBoundedString(provider.bearerToken, true)) {
++			return false;
++		}
++		if (provider.headers !== undefined && !isStringRecord(provider.headers)) {
++			return false;
++		}
++		return true;
++	});
++}
++
+ /**
+  * Methods handled by the request dispatcher. Excludes `initialize`,
+  * `reconnect`, and `ping`, which are handled directly during message
+@@ -523,6 +573,21 @@ export class ProtocolServerHandler extends Disposable implements IAgentHostClien
+ 					}
+ 					return;
+ 				}
++				// VS Code-private extension notification. It deliberately does not enter the
++				// generated AHP notification union because direct BYOK descriptors may carry
++				// credentials and therefore must never participate in state/replay/telemetry.
++				const extensionMethod = (msg as { readonly method?: string }).method;
++				if (extensionMethod === 'syncEphemeralByokModels') {
++					if (client) {
++						const models = (msg as { readonly params?: { readonly models?: unknown } }).params?.models;
++						if (isEphemeralByokModelList(models) && this._agentService.syncEphemeralByokModels) {
++							this._agentService.syncEphemeralByokModels(models);
++							this._logService.info(`[ProtocolServer] Updated ephemeral direct BYOK snapshot (${models.length} model(s))`);
++						}
++					}
++					return;
++				}
++
+ 				// Notification — fire-and-forget
+ 				switch (msg.method) {
+ 					case 'unsubscribe':
+diff --git code-server.orig/lib/vscode/src/vs/platform/agentHost/test/common/ahpJsonlLogger.test.ts code-server/lib/vscode/src/vs/platform/agentHost/test/common/ahpJsonlLogger.test.ts
+index 3cb01c3c17f..25aea805e0e 100644
+--- code-server.orig/lib/vscode/src/vs/platform/agentHost/test/common/ahpJsonlLogger.test.ts
++++ code-server/lib/vscode/src/vs/platform/agentHost/test/common/ahpJsonlLogger.test.ts
+@@ -114,6 +114,58 @@ suite('AhpJsonlLogger', () => {
+ 		}
+ 	});
+ 
++	test('redacts ephemeral BYOK credentials before JSONL serialization', async () => {
++		const fileService = store.add(new FileService(new NullLogService()));
++		store.add(fileService.registerProvider('file', store.add(new InMemoryFileSystemProvider())));
++
++		const logger = store.add(new AhpJsonlLogger(
++			{ logsHome: URI.file('/logs'), logId: 'byok-redaction', connectionId: 'byok-redaction', transport: 'websocket' },
++			fileService,
++			new NullLogService(),
++		));
++
++		const sentinel = 'KITDEV13_SENTINEL_DO_NOT_PERSIST';
++		logger.log({
++			jsonrpc: '2.0',
++			method: 'syncEphemeralByokModels',
++			params: {
++				channel: 'ahp:/',
++				models: [
++					{
++						vendor: 'custom',
++						id: 'model-1',
++						directProvider: {
++							name: 'private-provider',
++							type: 'openai',
++							baseUrl: `https://private.invalid/${sentinel}`,
++							apiKey: sentinel,
++							bearerToken: `bearer-${sentinel}`,
++							headers: { Authorization: `Bearer ${sentinel}`, 'X-Private': sentinel },
++							modelId: 'model-1',
++						},
++					},
++					{ vendor: 'renderer-only', id: 'model-2' },
++				],
++			},
++		}, 'c2s');
++		await logger.flush();
++
++		const content = (await fileService.readFile(logger.resource)).value.toString();
++		assert.strictEqual(content.includes(sentinel), false);
++		assert.strictEqual(content.includes('Authorization'), false);
++		assert.strictEqual(content.includes('private.invalid'), false);
++
++		const parsed = JSON.parse(content.trim());
++		assert.strictEqual(parsed.method, 'syncEphemeralByokModels');
++		assert.deepStrictEqual(parsed.params, {
++			channel: 'ahp:/',
++			redacted: true,
++			modelCount: 2,
++			directModelCount: 1,
++			bridgedModelCount: 1,
++		});
++	});
++
+ 	test('rotates JSONL files and keeps bounded history', async () => {
+ 		const fileService = store.add(new FileService(new NullLogService()));
+ 		store.add(fileService.registerProvider('file', store.add(new InMemoryFileSystemProvider())));
+diff --git code-server.orig/lib/vscode/src/vs/platform/agentHost/test/node/byokLmBridgeRegistry.test.ts code-server/lib/vscode/src/vs/platform/agentHost/test/node/byokLmBridgeRegistry.test.ts
+index b1de0c2fa19..840d0f249d5 100644
+--- code-server.orig/lib/vscode/src/vs/platform/agentHost/test/node/byokLmBridgeRegistry.test.ts
++++ code-server/lib/vscode/src/vs/platform/agentHost/test/node/byokLmBridgeRegistry.test.ts
+@@ -59,6 +59,64 @@ suite('ByokLmBridgeRegistry', () => {
+ 		regNonServing.dispose();
+ 	});
+ 
++
++	test('direct models survive renderer disconnect and do not require a serving connection', () => {
++		const registry = new ByokLmBridgeRegistry();
++		const renderer = pushable();
++		const registration = registry.register('editor', renderer.connection);
++		renderer.push([{ vendor: 'acme', id: 'renderer-only' }]);
++		const direct = {
++			vendor: 'openrouter',
++			id: 'model-a',
++			modelIdentifier: 'openrouter/work/model-a',
++			directProvider: {
++				name: 'vscode-byok-openrouter-abc',
++				type: 'openai' as const,
++				wireApi: 'completions' as const,
++				baseUrl: 'https://example.test/v1',
++				apiKey: 'secret-in-memory-only',
++				modelId: 'model-a',
++			},
++		};
++		registry.setDirectModels([direct]);
++
++		registration.dispose();
++
++		assert.deepStrictEqual(registry.getModels(), [direct]);
++		assert.strictEqual(registry.getServingConnection(), undefined);
++	});
++
++	test('direct models replace their bridged copies while renderer-only fallbacks remain', () => {
++		const registry = new ByokLmBridgeRegistry();
++		const renderer = pushable();
++		const registration = registry.register('editor', renderer.connection);
++		const direct = {
++			vendor: 'openrouter',
++			id: 'model-a',
++			modelIdentifier: 'openrouter/work/model-a',
++			directProvider: {
++				name: 'vscode-byok-openrouter-abc',
++				type: 'openai' as const,
++				wireApi: 'completions' as const,
++				baseUrl: 'https://example.test/v1',
++				apiKey: 'secret-in-memory-only',
++				modelId: 'model-a',
++			},
++		};
++		renderer.push([
++			direct,
++			{ vendor: 'unsupported', id: 'renderer-only' },
++		]);
++		registry.setDirectModels([direct]);
++
++		assert.deepStrictEqual(registry.getModels(), [
++			direct,
++			{ vendor: 'unsupported', id: 'renderer-only' },
++		]);
++
++		registration.dispose();
++	});
++
+ 	test('a window that pushes an empty list is still a valid serving target', () => {
+ 		const registry = new ByokLmBridgeRegistry();
+ 		const only = pushable();
+diff --git code-server.orig/lib/vscode/src/vs/platform/agentHost/test/node/copilotSessionLauncher.test.ts code-server/lib/vscode/src/vs/platform/agentHost/test/node/copilotSessionLauncher.test.ts
+index 730fc18ab32..8f52fe7b0e6 100644
+--- code-server.orig/lib/vscode/src/vs/platform/agentHost/test/node/copilotSessionLauncher.test.ts
++++ code-server/lib/vscode/src/vs/platform/agentHost/test/node/copilotSessionLauncher.test.ts
+@@ -417,6 +417,45 @@ suite('resolveByokSessionConfig', () => {
+ 		assert.strictEqual(proxy.starts, 0);
+ 	});
+ 
++
++	test('uses a direct provider without starting the renderer proxy', async () => {
++		const registry = new ByokLmBridgeRegistry();
++		registry.setDirectModels([{
++			vendor: 'customendpoint',
++			id: 'fixture-model',
++			name: 'Fixture Model',
++			maxContextWindowTokens: 128000,
++			directProvider: {
++				name: 'vscode-byok-customendpoint-abc',
++				type: 'openai',
++				wireApi: 'responses',
++				baseUrl: 'https://example.test/v1',
++				apiKey: 'ephemeral-secret',
++				modelId: 'fixture-model',
++			},
++		}]);
++		const proxy = countingProxy();
++
++		const config = await resolveByokSessionConfig(sessionId, registry, proxy.startProxy, log);
++
++		assert.strictEqual(proxy.starts, 0);
++		assert.deepStrictEqual(config, {
++			providers: [{
++				name: 'vscode-byok-customendpoint-abc',
++				type: 'openai',
++				wireApi: 'responses',
++				baseUrl: 'https://example.test/v1',
++				apiKey: 'ephemeral-secret',
++			}],
++			models: [{
++				id: 'fixture-model',
++				provider: 'vscode-byok-customendpoint-abc',
++				name: 'Fixture Model',
++				maxContextWindowTokens: 128000,
++			}],
++		});
++	});
++
+ 	test('synthesizes deduped providers and per-model config from the active bridge', async () => {
+ 		const registry = new ByokLmBridgeRegistry();
+ 		const registration = registry.register('client-1', connectionOf([
+diff --git code-server.orig/lib/vscode/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts code-server/lib/vscode/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts
+index c8251749380..b73d339440d 100644
+--- code-server.orig/lib/vscode/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts
++++ code-server/lib/vscode/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts
+@@ -22,6 +22,7 @@ import { NullTelemetryService } from '../../../telemetry/common/telemetryUtils.j
+ import { ITelemetryService, TelemetryLevel } from '../../../telemetry/common/telemetry.js';
+ import { type IAgentCreateChatRequestOptions, type IAgentCreateSessionConfig, type IAgentResolveSessionConfigParams, type IAgentSessionConfigCompletionsParams, type IAgentSessionMetadata, type AuthenticateParams, type AuthenticateResult } from '../../common/agent.js';
+ import { type IAgentHostManagedSettingsDiagnostics, type IAgentHostNetworkDiagnosticsInfo, type IAgentHostNetworkFetchResult, type IAgentService } from '../../common/agentService.js';
++import type { IByokLmModelInfo } from '../../common/agentHostByokLm.js';
+ import { DevContainerConnectExtensionMethod, DevContainerDisconnectExtensionMethod, DevContainerIsDockerAvailableExtensionMethod, DevContainerOutputNotification, RemoveSessionArtifactExtensionMethod, RequestAgentHostWorkspaceTrustExtensionMethod, supportsAgentHostArtifactRemoval, supportsAgentHostDevContainers } from '../../common/agentHostExtensionProtocol.js';
+ import { ChatSourceKind, CompletionsParams, CompletionsResult, ContentEncoding, ListSessionsResult, ResourceReadResult, ResolveSessionConfigResult, SessionConfigCompletionsResult, ResourceMkdirParams, ResourceMkdirResult, ResourceResolveParams, ResourceResolveResult, ResourceCopyParams, ResourceCopyResult } from '../../common/state/protocol/commands.js';
+ import type { AutomationCapabilities, Implementation } from '../../common/state/protocol/common/commands.js';
+@@ -179,6 +180,7 @@ class MockAgentService implements IAgentService {
+ 	readonly unsubscribeCalls: { resource: string; clientId: string }[] = [];
+ 	afterListSessionsSnapshot: (() => void) | undefined;
+ 	readonly automationRunRequests: RunAutomationParams[] = [];
++	readonly ephemeralByokSnapshots: IByokLmModelInfo[][] = [];
+ 	automationRunResult: RunAutomationResult | undefined;
+ 
+ 	private readonly _onDidAction = new Emitter<import('../../common/state/sessionActions.js').ActionEnvelope>();
+@@ -195,6 +197,10 @@ class MockAgentService implements IAgentService {
+ 		this._stateManager = sm;
+ 	}
+ 
++	syncEphemeralByokModels(models: readonly IByokLmModelInfo[]): void {
++		this.ephemeralByokSnapshots.push([...models]);
++	}
++
+ 	dispatchAction(channel: string, action: SessionAction | ChatAction | TerminalAction | ClientChangesetAction | ClientAnnotationsAction | IRootConfigChangedAction | ClientAutomationAction | ClientAutomationRunAction, clientId: string, clientSeq: number, clientContext?: IAgentHostClientTelemetryContext): void {
+ 		this.handledActions.push(action);
+ 		this.handledClientTypes.push(clientContext?.clientType);
+@@ -4461,6 +4467,50 @@ suite('ProtocolServerHandler', () => {
+ 		assert.deepStrictEqual(response.result, agentService.managedSettingsDiagnostics);
+ 	});
+ 
++
++	test('syncEphemeralByokModels accepts only bounded direct snapshots without echoing credential material', async () => {
++		const transport = connectClient('client-ephemeral-byok');
++		transport.sent.length = 0;
++		const secret = 'test-secret-not-for-wire-echo';
++		const valid: IByokLmModelInfo = {
++			vendor: 'customendpoint',
++			id: 'fixture-model',
++			name: 'Fixture Model',
++			directProvider: {
++				name: 'vscode-byok-customendpoint-1',
++				type: 'openai',
++				wireApi: 'completions',
++				baseUrl: 'https://example.invalid/v1',
++				apiKey: secret,
++				headers: { 'x-provider-test': 'ok' },
++				modelId: 'fixture-model',
++			},
++		};
++
++		transport.simulateMessage(notification('syncEphemeralByokModels', {
++			channel: 'ahp-root://',
++			models: [valid],
++		}));
++		transport.simulateMessage(notification('syncEphemeralByokModels', {
++			channel: 'ahp-root://',
++			models: [{ ...valid, directProvider: { ...valid.directProvider!, type: 'bogus' } }],
++		}));
++		transport.simulateMessage(notification('syncEphemeralByokModels', {
++			channel: 'ahp-root://',
++			models: [{ ...valid, directProvider: { ...valid.directProvider!, apiKey: 'x'.repeat(16 * 1024 + 1) } }],
++		}));
++		transport.simulateMessage(notification('syncEphemeralByokModels', {
++			channel: 'ahp-root://',
++			models: [{ vendor: 'customendpoint', id: 'missing-direct-provider' }],
++		}));
++		await Promise.resolve();
++
++		assert.deepStrictEqual(agentService.ephemeralByokSnapshots, [[valid]]);
++		assert.strictEqual(agentService.handledActions.length, 0);
++		assert.strictEqual(transport.sent.length, 0);
++		assert.ok(!JSON.stringify(transport.sent).includes(secret));
++	});
++
+ 	test('setClientManagedSettingsPermissions validates and attributes contributions to the connected client', async () => {
+ 		const transport = connectClient('client-managed-settings-contribution');
+ 		transport.sent.length = 0;
+diff --git code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHost.contribution.ts code-server/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHost.contribution.ts
+index 15df604bd9f..28397566410 100644
+--- code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHost.contribution.ts
++++ code-server/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHost.contribution.ts
+@@ -15,9 +15,11 @@
+  */
+ 
+ import { IAgentHostByokLmHandler } from '../../../../../../platform/agentHost/common/agentHostByokLm.js';
++import { CancellationToken } from '../../../../../../base/common/cancellation.js';
+ import { InstantiationType, registerSingleton } from '../../../../../../platform/instantiation/common/extensions.js';
+ import { Disposable } from '../../../../../../base/common/lifecycle.js';
+ import { IConfigurationService } from '../../../../../../platform/configuration/common/configuration.js';
++import { IAgentHostService } from '../../../../../../platform/agentHost/common/agentService.js';
+ import { registerWorkbenchContribution2, IWorkbenchContribution, WorkbenchPhase } from '../../../../../common/contributions.js';
+ import { AgentHostAllowSignedOutWhenUsableContribution } from './agentHostAllowSignedOutWhenUsableContribution.js';
+ import { AgentHostByokLmHandler } from './agentHostByokLmHandler.js';
+@@ -36,9 +38,40 @@ import './agentHostSettings.contribution.js';
+ import './agentSessionSettings.contribution.js';
+ 
+ /**
+- * Freezes the legacy-migration setting at startup so enabling it only takes effect
+- * on the next window reload. Runs before any session can be opened (BlockStartup).
++ * Keeps direct-capable BYOK descriptors in remote Agent Host process memory.
++ * The snapshot is deliberately ephemeral: it survives renderer disconnects but
++ * is lost when the Agent Host restarts.
+  */
++class AgentHostRemoteByokSyncContribution extends Disposable implements IWorkbenchContribution {
++	static readonly ID = 'workbench.contrib.chat.agentHostRemoteByokSync';
++	private _generation = 0;
++
++	constructor(
++		@IAgentHostByokLmHandler private readonly _handler: IAgentHostByokLmHandler,
++		@IAgentHostService private readonly _agentHostService: IAgentHostService,
++	) {
++		super();
++		if (!this._agentHostService.syncEphemeralByokModels) {
++			return;
++		}
++		const sync = () => { void this._sync(); };
++		this._register(this._agentHostService.onAgentHostStart(sync));
++		if (this._handler.onDidChangeModels) {
++			this._register(this._handler.onDidChangeModels(sync));
++		}
++		sync();
++	}
++
++	private async _sync(): Promise<void> {
++		const generation = ++this._generation;
++		const models = await this._handler.listModels(CancellationToken.None);
++		if (generation !== this._generation) {
++			return;
++		}
++		this._agentHostService.syncEphemeralByokModels?.(models.filter(model => !!model.directProvider));
++	}
++}
++
+ class AgentHostLegacyMigrationGateContribution extends Disposable implements IWorkbenchContribution {
+ 	static readonly ID = 'workbench.contrib.chat.agentHostLegacyMigrationGate';
+ 	constructor(@IConfigurationService configurationService: IConfigurationService) {
+@@ -48,6 +81,7 @@ class AgentHostLegacyMigrationGateContribution extends Disposable implements IWo
+ }
+ 
+ registerWorkbenchContribution2(AgentHostContribution.ID, AgentHostContribution, WorkbenchPhase.AfterRestored);
++registerWorkbenchContribution2(AgentHostRemoteByokSyncContribution.ID, AgentHostRemoteByokSyncContribution, WorkbenchPhase.AfterRestored);
+ registerWorkbenchContribution2(AgentHostExistingSessionHarnessPickerEnablement.ID, AgentHostExistingSessionHarnessPickerEnablement, WorkbenchPhase.BlockRestore);
+ registerWorkbenchContribution2(AgentHostLegacyMigrationGateContribution.ID, AgentHostLegacyMigrationGateContribution, WorkbenchPhase.BlockStartup);
+ registerWorkbenchContribution2(CopilotConfigSlashSubmitHandlerContribution.ID, CopilotConfigSlashSubmitHandlerContribution, WorkbenchPhase.AfterRestored);
+diff --git code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostByokLmHandler.ts code-server/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostByokLmHandler.ts
+index 29c36d99b7d..f2600020659 100644
+--- code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostByokLmHandler.ts
++++ code-server/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostByokLmHandler.ts
+@@ -6,6 +6,7 @@
+ import { CancellationToken } from '../../../../../../base/common/cancellation.js';
+ import { Emitter, Event } from '../../../../../../base/common/event.js';
+ import { Disposable } from '../../../../../../base/common/lifecycle.js';
++import { hash } from '../../../../../../base/common/hash.js';
+ import { decodeBase64, VSBuffer } from '../../../../../../base/common/buffer.js';
+ import {
+ 	ByokLmImageMimeType,
+@@ -15,6 +16,7 @@ import {
+ 	IByokLmChatResult,
+ 	IByokLmContentPart,
+ 	IByokLmInputItem,
++	IByokLmDirectProviderConfig,
+ 	IByokLmModelInfo,
+ 	IByokLmOutputItem,
+ 	IByokLmReasoningItem,
+@@ -39,6 +41,102 @@ const REASONING_METADATA_PREFIX = 'vscode-reasoning-metadata:';
+ const VSCODE_REASONING_SUMMARY_PART_DONE = 'vscode_reasoning_summary_part_done';
+ const CLIENT_BYOK_CONTEXT_KEYS = new Set([ChatEntitlementContextKeys.clientByokEnabled.key]);
+ 
++
++const DIRECT_BYOK_VENDORS = new Set(['openai', 'openrouter', 'xai', 'anthropic', 'ollama', 'customoai', 'customendpoint']);
++
++function asRecord(value: unknown): Record<string, unknown> | undefined {
++	return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
++}
++
++function asStringRecord(value: unknown): Record<string, string> | undefined {
++	const record = asRecord(value);
++	if (!record || !Object.values(record).every(candidate => typeof candidate === 'string')) {
++		return undefined;
++	}
++	return record as Record<string, string>;
++}
++
++function providerName(vendor: string, identifier: string): string {
++	return `vscode-byok-${vendor}-${(hash(identifier) >>> 0).toString(16)}`;
++}
++
++function trimEndpointPath(url: string, apiType: 'completions' | 'responses' | 'messages'): string {
++	const suffix = apiType === 'completions' ? '/chat/completions' : `/${apiType}`;
++	const queryIndex = url.indexOf('?');
++	const withoutQuery = queryIndex >= 0 ? url.slice(0, queryIndex) : url;
++	return withoutQuery.endsWith(suffix) ? withoutQuery.slice(0, -suffix.length) : withoutQuery.replace(/\/$/, '');
++}
++
++function resolveCustomEndpoint(url: string, apiType: 'chat-completions' | 'responses' | 'messages' | undefined): { baseUrl: string; type: 'openai' | 'anthropic'; wireApi?: 'completions' | 'responses' } {
++	let normalized = url.replace(/\/$/, '');
++	let resolvedType = apiType;
++	if (!resolvedType) {
++		resolvedType = normalized.includes('/messages') ? 'messages' : normalized.includes('/responses') ? 'responses' : 'chat-completions';
++	}
++	const path = resolvedType === 'messages' ? '/messages' : resolvedType === 'responses' ? '/responses' : '/chat/completions';
++	if (!normalized.includes('/messages') && !normalized.includes('/responses') && !normalized.includes('/chat/completions')) {
++		normalized = /\/v\d+$/.test(normalized) ? `${normalized}${path}` : `${normalized}/v1${path}`;
++	}
++	if (resolvedType === 'messages') {
++		return { baseUrl: trimEndpointPath(normalized, 'messages'), type: 'anthropic' };
++	}
++	const wireApi = resolvedType === 'responses' ? 'responses' : 'completions';
++	return { baseUrl: trimEndpointPath(normalized, wireApi), type: 'openai', wireApi };
++}
++
++function replaceApiKey(headers: Record<string, string> | undefined, apiKey: string | undefined): Record<string, string> | undefined {
++	if (!headers) {
++		return undefined;
++	}
++	return Object.fromEntries(Object.entries(headers).map(([key, value]) => [key, apiKey ? value.split('${apiKey}').join(apiKey) : value]));
++}
++
++function toDirectProvider(vendor: string, identifier: string, modelId: string, configuration: Record<string, unknown>): IByokLmDirectProviderConfig | undefined {
++	if (!DIRECT_BYOK_VENDORS.has(vendor)) {
++		return undefined;
++	}
++	const apiKey = typeof configuration.apiKey === 'string' ? configuration.apiKey : undefined;
++	const name = providerName(vendor, identifier);
++	if (vendor === 'openai') {
++		return { name, type: 'openai', wireApi: 'completions', baseUrl: 'https://api.openai.com/v1', apiKey, modelId };
++	}
++	if (vendor === 'openrouter') {
++		return { name, type: 'openai', wireApi: 'completions', baseUrl: 'https://openrouter.ai/api/v1', apiKey, modelId };
++	}
++	if (vendor === 'xai') {
++		return { name, type: 'openai', wireApi: 'completions', baseUrl: 'https://api.x.ai/v1', apiKey, modelId };
++	}
++	if (vendor === 'anthropic') {
++		return { name, type: 'anthropic', baseUrl: 'https://api.anthropic.com', apiKey, modelId };
++	}
++	if (vendor === 'ollama') {
++		const url = typeof configuration.url === 'string' ? configuration.url.replace(/\/$/, '') : undefined;
++		return url ? { name, type: 'openai', wireApi: 'completions', baseUrl: `${url}/v1`, ...(apiKey ? { apiKey } : {}), modelId } : undefined;
++	}
++
++	const models = Array.isArray(configuration.models) ? configuration.models : [];
++	const modelConfiguration = models.map(asRecord).find(model => model?.id === modelId);
++	const url = typeof modelConfiguration?.url === 'string' ? modelConfiguration.url : typeof configuration.url === 'string' ? configuration.url : undefined;
++	if (!url) {
++		return undefined;
++	}
++	const apiType = vendor === 'customendpoint'
++		? (typeof modelConfiguration?.apiType === 'string' ? modelConfiguration.apiType : configuration.apiType) as 'chat-completions' | 'responses' | 'messages' | undefined
++		: (url.includes('/responses') ? 'responses' : 'chat-completions');
++	const resolved = resolveCustomEndpoint(url, apiType);
++	const headers = replaceApiKey(asStringRecord(modelConfiguration?.requestHeaders), apiKey);
++	const hasExplicitAuthHeader = headers && Object.keys(headers).some(key => ['authorization', 'api-key', 'x-api-key', 'apikey', 'ocp-apim-subscription-key', 'x-functions-key', 'x-goog-api-key'].includes(key.toLowerCase()));
++	return {
++		name,
++		type: resolved.type,
++		...(resolved.wireApi ? { wireApi: resolved.wireApi } : {}),
++		baseUrl: resolved.baseUrl,
++		...(!hasExplicitAuthHeader && apiKey ? { apiKey } : {}),
++		...(headers ? { headers } : {}),
++		modelId,
++	};
++}
++
+ /**
+  * Renderer-side {@link IAgentHostByokLmHandler}. Services BYOK chat requests
+  * forwarded by the node agent host's OpenAI proxy by calling the VS Code LM
+@@ -169,6 +267,10 @@ export class AgentHostByokLmHandler extends Disposable implements IAgentHostByok
+ 			// Only genuine renderer BYOK models — exclude agent-host copies, which
+ 			// carry a `targetChatSessionType` and would otherwise re-enter the bridge.
+ 			if (metadata?.isBYOK && !metadata.targetChatSessionType) {
++				const resolvedProvider = await this._languageModelsService.getResolvedProviderConfiguration?.(identifier);
++				const directProvider = resolvedProvider
++					? toDirectProvider(metadata.vendor, identifier, metadata.id, resolvedProvider.configuration)
++					: undefined;
+ 				const reasoningEffortSchema = metadata.configurationSchema?.properties?.reasoningEffort;
+ 				const supportedReasoningEfforts = reasoningEffortSchema?.enum?.filter((value): value is string => typeof value === 'string');
+ 				const defaultReasoningEffort = typeof reasoningEffortSchema?.default === 'string' ? reasoningEffortSchema.default : undefined;
+@@ -183,6 +285,7 @@ export class AgentHostByokLmHandler extends Disposable implements IAgentHostByok
+ 					supportsVision: !!metadata.capabilities?.vision,
+ 					...(supportedReasoningEfforts?.length ? { supportedReasoningEfforts } : {}),
+ 					...(defaultReasoningEffort !== undefined ? { defaultReasoningEffort } : {}),
++					...(directProvider ? { directProvider } : {}),
+ 				};
+ 				const agentHostModelIdentifier = `${SessionType.AgentHostCopilot}:${getByokLmAgentModelId(model)}`;
+ 				if (!this._languageModelsService.isModelHidden(identifier) && !this._languageModelsService.isModelHidden(agentHostModelIdentifier)) {
+diff --git code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/common/languageModels.ts code-server/lib/vscode/src/vs/workbench/contrib/chat/common/languageModels.ts
+index 00843fbde50..3a7789fafd1 100644
+--- code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/common/languageModels.ts
++++ code-server/lib/vscode/src/vs/workbench/contrib/chat/common/languageModels.ts
+@@ -560,6 +560,12 @@ export interface ILanguageModelsGroup {
+ 	};
+ }
+ 
++export interface ILanguageModelResolvedProviderConfiguration {
++	readonly name: string;
++	/** Resolved in-memory provider configuration. Secret schema fields contain their decrypted values. */
++	readonly configuration: IStringDictionary<unknown>;
++}
++
+ /** Read/write access to model-specific configuration, globally or within one conversation. */
+ export interface IModelConfigurationAccess {
+ 	getModelConfiguration(modelId: string): IStringDictionary<unknown> | undefined;
+@@ -597,6 +603,9 @@ export interface ILanguageModelsService {
+ 
+ 	getLanguageModelGroups(vendor: string): ILanguageModelsGroup[];
+ 
++	/** Resolve the provider-group configuration backing a model, including in-memory secret values. */
++	getResolvedProviderConfiguration?(modelId: string): Promise<ILanguageModelResolvedProviderConfiguration | undefined>;
++
+ 	/**
+ 	 * Returns true if the given vendor's provider has completed at least one
+ 	 * model resolution since registration. A `false` result indicates the
+@@ -1464,6 +1473,19 @@ export class LanguageModelsService implements ILanguageModelsService {
+ 		return this._modelsGroups.get(vendor) ?? [];
+ 	}
+ 
++	async getResolvedProviderConfiguration(modelId: string): Promise<ILanguageModelResolvedProviderConfiguration | undefined> {
++		const metadata = this._modelCache.get(modelId);
++		if (!metadata) {
++			return undefined;
++		}
++		const group = this._modelsGroups.get(metadata.vendor)?.find(candidate => candidate.modelIdentifiers.includes(modelId))?.group;
++		if (!group) {
++			return undefined;
++		}
++		const schema = this._vendors.get(metadata.vendor)?.configuration;
++		return { name: group.name, configuration: await this._resolveConfiguration(group, schema) };
++	}
++
+ 	hasResolvedVendor(vendor: string): boolean {
+ 		return this._modelsGroups.has(vendor);
+ 	}
+diff --git code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostByokLmHandler.test.ts code-server/lib/vscode/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostByokLmHandler.test.ts
+index 44725d74ab5..a7639008cc4 100644
+--- code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostByokLmHandler.test.ts
++++ code-server/lib/vscode/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostByokLmHandler.test.ts
+@@ -18,7 +18,7 @@ import { IContextKey, IContextKeyService } from '../../../../../../platform/cont
+ import { ChatEntitlementContextKeys, IChatEntitlementService } from '../../../../../services/chat/common/chatEntitlementService.js';
+ import { AgentHostByokLmHandler } from '../../../browser/agentSessions/agentHost/agentHostByokLmHandler.js';
+ import { SessionType } from '../../../common/chatSessionsService.js';
+-import { ChatMessageRole, IChatMessage, IChatResponsePart, ILanguageModelChatMetadata, ILanguageModelChatRequestOptions, ILanguageModelChatResponse, ILanguageModelsService } from '../../../common/languageModels.js';
++import { ChatMessageRole, IChatMessage, IChatResponsePart, ILanguageModelChatMetadata, ILanguageModelChatRequestOptions, ILanguageModelChatResponse, ILanguageModelResolvedProviderConfiguration, ILanguageModelsService } from '../../../common/languageModels.js';
+ 
+ interface ICapturedRequest {
+ 	modelId: string;
+@@ -44,6 +44,7 @@ class TestLanguageModelsService extends mock<ILanguageModelsService>() {
+ 		private readonly _respond: (request: ICapturedRequest) => ILanguageModelChatResponse,
+ 		onDidChangeModelVisibility = Event.None,
+ 		private readonly _isModelHidden: (identifier: string) => boolean = () => false,
++		private readonly _providerConfigurations: ReadonlyMap<string, ILanguageModelResolvedProviderConfiguration> = new Map(),
+ 	) {
+ 		super();
+ 		this.onDidChangeModelVisibility = onDidChangeModelVisibility;
+@@ -57,6 +58,10 @@ class TestLanguageModelsService extends mock<ILanguageModelsService>() {
+ 		return this._models.get(modelId);
+ 	}
+ 
++	override async getResolvedProviderConfiguration(modelId: string): Promise<ILanguageModelResolvedProviderConfiguration | undefined> {
++		return this._providerConfigurations.get(modelId);
++	}
++
+ 	override isModelHidden(identifier: string): boolean {
+ 		return this._isModelHidden(identifier);
+ 	}
+@@ -197,6 +202,47 @@ suite('AgentHostByokLmHandler', () => {
+ 		]);
+ 	});
+ 
++
++	test('listModels attaches an ephemeral direct OpenAI-compatible provider config', async () => {
++		const identifier = 'customendpoint/Test Group/fixture-model';
++		const service = new TestLanguageModelsService(
++			new Map([[identifier, byokModel('customendpoint', 'fixture-model')]]),
++			() => responseOf([]),
++			Event.None,
++			() => false,
++			new Map([[identifier, {
++				name: 'Test Group',
++				configuration: {
++					apiKey: 'ephemeral-secret',
++					models: [{
++						id: 'fixture-model',
++						name: 'Fixture Model',
++						url: 'https://example.test/v1/responses',
++						apiType: 'responses',
++						maxOutputTokens: 8192,
++						toolCalling: true,
++						vision: false,
++					}],
++				},
++			}]]),
++		);
++		const handler = createHandler(service);
++
++		const [model] = await handler.listModels(CancellationToken.None);
++
++		assert.strictEqual(model.vendor, 'customendpoint');
++		assert.strictEqual(model.id, 'fixture-model');
++		assert.ok(model.directProvider?.name.startsWith('vscode-byok-customendpoint-'));
++		assert.deepStrictEqual({ ...model.directProvider, name: '<stable-synthetic>' }, {
++			name: '<stable-synthetic>',
++			type: 'openai',
++			wireApi: 'responses',
++			baseUrl: 'https://example.test/v1',
++			apiKey: 'ephemeral-secret',
++			modelId: 'fixture-model',
++		});
++	});
++
+ 	test('listModels excludes hidden BYOK sources and Agent Host copies', async () => {
+ 		const sourceIdentifier = 'openrouter/OpenRouter 2/ai21/jamba-large-1.7';
+ 		const agentHostIdentifier = `${SessionType.AgentHostCopilot}:openrouter/OpenRouter 2/ai21/jamba-large-1.7`;
+diff --git code-server.orig/lib/vscode/src/vs/workbench/services/agentHost/browser/editorRemoteAgentHostServiceClient.ts code-server/lib/vscode/src/vs/workbench/services/agentHost/browser/editorRemoteAgentHostServiceClient.ts
+index 88ac9027e2a..bb82a6c229e 100644
+--- code-server.orig/lib/vscode/src/vs/workbench/services/agentHost/browser/editorRemoteAgentHostServiceClient.ts
++++ code-server/lib/vscode/src/vs/workbench/services/agentHost/browser/editorRemoteAgentHostServiceClient.ts
+@@ -21,6 +21,7 @@ import { IAgentHostEnablementService } from '../../../../platform/agentHost/comm
+ import { AgentHostIpcChannelTransport } from '../../../../platform/agentHost/browser/agentHostIpcChannelTransport.js';
+ import { AgentHostClientConnectionKind } from '../../../../platform/agentHost/common/agentHostTelemetry.js';
+ import { AgentHostClientState, AgentHostProtocolClient } from '../../../../platform/agentHost/browser/agentHostProtocolClient.js';
++import type { IByokLmModelInfo } from '../../../../platform/agentHost/common/agentHostByokLm.js';
+ import type { IActiveSubscriptionInfo, IAgentSubscription } from '../../../../platform/agentHost/common/state/agentSubscription.js';
+ import type { CompletionsParams, CompletionsResult, ContentEncoding, CreateTerminalParams, ResolveSessionConfigResult, SessionConfigCompletionsResult } from '../../../../platform/agentHost/common/state/protocol/commands.js';
+ import type { InvokeChangesetOperationParams, InvokeChangesetOperationResult } from '../../../../platform/agentHost/common/state/protocol/channels-changeset/commands.js';
+@@ -163,6 +164,10 @@ export class EditorRemoteAgentHostServiceClient extends Disposable implements IA
+ 		this._connect().catch(err => this._logService.warn(`${LOG_PREFIX} Connect failed`, err));
+ 	}
+ 
++	syncEphemeralByokModels(models: readonly IByokLmModelInfo[]): void {
++		this._protocolClient?.syncEphemeralByokModels(models);
++	}
++
+ 	async restartAgentHost(): Promise<void> {
+ 		// The remote owns the agent host process lifecycle.
+ 	}
