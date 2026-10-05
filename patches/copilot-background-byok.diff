@@ -44,23 +44,20 @@ index 13c43541aad..9b864ba95fe 100644
  		const seq = this._subscriptionManager.dispatchOptimistic(channel, action);
  		this.dispatchAction(channel, action, this._clientId, seq);
 diff --git code-server.orig/lib/vscode/src/vs/platform/agentHost/common/agentHostByokLm.ts code-server/lib/vscode/src/vs/platform/agentHost/common/agentHostByokLm.ts
-index fef22bec3b8..87803046098 100644
+index fef22bec3b8..97491f31fc2 100644
 --- code-server.orig/lib/vscode/src/vs/platform/agentHost/common/agentHostByokLm.ts
 +++ code-server/lib/vscode/src/vs/platform/agentHost/common/agentHostByokLm.ts
-@@ -135,6 +135,20 @@ export interface IByokLmChatResult {
+@@ -135,6 +135,17 @@ export interface IByokLmChatResult {
   * Metadata for a renderer BYOK model, enumerated over the bridge so the node
   * agent host can advertise it to the SDK runtime without any host-side config.
   */
 +export interface IByokLmDirectProviderConfig {
 +	/** Synthetic SDK provider name. Unique per endpoint/configuration so credentials never cross provider groups. */
 +	readonly name: string;
-+	readonly type: 'openai' | 'azure' | 'anthropic';
++	readonly type: 'openai' | 'anthropic';
 +	readonly wireApi?: 'completions' | 'responses';
 +	readonly baseUrl: string;
 +	readonly apiKey?: string;
-+	readonly bearerToken?: string;
-+	readonly headers?: Readonly<Record<string, string>>;
-+	readonly azure?: { readonly apiVersion?: string };
 +	/** Provider-local model id handed to the SDK. */
 +	readonly modelId: string;
 +}
@@ -68,7 +65,7 @@ index fef22bec3b8..87803046098 100644
  export interface IByokLmModelInfo {
  	/** Provider/vendor name (the LM API vendor that registered the model). */
  	readonly vendor: string;
-@@ -161,6 +175,11 @@ export interface IByokLmModelInfo {
+@@ -161,6 +172,11 @@ export interface IByokLmModelInfo {
  	readonly supportedReasoningEfforts?: readonly string[];
  	/** Default reasoning effort advertised by the renderer model, when known. */
  	readonly defaultReasoningEffort?: string;
@@ -80,7 +77,7 @@ index fef22bec3b8..87803046098 100644
  }
  
  /**
-@@ -177,7 +196,9 @@ export function getByokLmSelectionModelId(model: IByokLmModelInfo): string {
+@@ -177,7 +193,9 @@ export function getByokLmSelectionModelId(model: IByokLmModelInfo): string {
  
  /** Returns the provider-qualified model id advertised by the agent host. */
  export function getByokLmAgentModelId(model: IByokLmModelInfo): string {
@@ -354,7 +351,7 @@ index d8797c1fce6..ba8e945cbb6 100644
  		return [];
  	}
 diff --git code-server.orig/lib/vscode/src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts code-server/lib/vscode/src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts
-index 0582691d039..cd332af0de6 100644
+index 0582691d039..9eb363a1495 100644
 --- code-server.orig/lib/vscode/src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts
 +++ code-server/lib/vscode/src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts
 @@ -13,7 +13,7 @@ import { generateUuid } from '../../../../base/common/uuid.js';
@@ -366,7 +363,7 @@ index 0582691d039..cd332af0de6 100644
  import { AgentHostByokModelsEnabledConfigKey, AgentHostMcpConnectorsEnabledConfigKey, AgentHostSessionSyncEnabledConfigKey, platformRootSchema, type AgentHostMcpServers } from '../../common/agentHostSchema.js';
  import { CopilotCliConfigKey, copilotCliConfigSchema, normalizeModelFamilyAlias, normalizeToolSearchDeferThreshold, resolveModelCapabilityOverrideField } from '../../common/copilotCliConfig.js';
  import { IAgentHostOTelService } from '../../common/otel/agentHostOTelService.js';
-@@ -549,60 +549,94 @@ export async function resolveByokSessionConfig(
+@@ -549,60 +549,91 @@ export async function resolveByokSessionConfig(
  	startProxy: () => Promise<IByokLmProxyHandle>,
  	logService: ILogService,
  ): Promise<{ providers?: NamedProviderConfig[]; models?: ProviderModelConfig[] }> {
@@ -433,9 +430,6 @@ index 0582691d039..cd332af0de6 100644
 +				...(direct.wireApi ? { wireApi: direct.wireApi } : {}),
 +				baseUrl: direct.baseUrl,
 +				...(direct.apiKey !== undefined ? { apiKey: direct.apiKey } : {}),
-+				...(direct.bearerToken !== undefined ? { bearerToken: direct.bearerToken } : {}),
-+				...(direct.headers ? { headers: { ...direct.headers } } : {}),
-+				...(direct.azure ? { azure: { ...direct.azure } } : {}),
 +			});
 +		}
 +		models.push({
@@ -499,7 +493,7 @@ index 0582691d039..cd332af0de6 100644
  
  /** Applies sandbox configuration, returning false when the runtime retains its policy after a managed conflict. */
 diff --git code-server.orig/lib/vscode/src/vs/platform/agentHost/node/protocolServerHandler.ts code-server/lib/vscode/src/vs/platform/agentHost/node/protocolServerHandler.ts
-index 8f6466a1ef8..9c009a7c41c 100644
+index 8f6466a1ef8..19622cfe6d7 100644
 --- code-server.orig/lib/vscode/src/vs/platform/agentHost/node/protocolServerHandler.ts
 +++ code-server/lib/vscode/src/vs/platform/agentHost/node/protocolServerHandler.ts
 @@ -18,6 +18,7 @@ import { AHPFileSystemProvider } from '../common/agentHostFileSystemProvider.js'
@@ -510,20 +504,39 @@ index 8f6466a1ef8..9c009a7c41c 100644
  import { isManagedSettingsPermissions } from '../common/agentHostManagedSettings.js';
  import { isAnnotationsUri } from '../common/annotationsUri.js';
  import { parseChangesetUri } from '../common/changesetUri.js';
-@@ -145,6 +146,55 @@ function readMcpChannel(params: unknown): string | undefined {
+@@ -145,6 +146,81 @@ function readMcpChannel(params: unknown): string | undefined {
  	return channel;
  }
  
 +const MAX_EPHEMERAL_BYOK_MODELS = 256;
 +const MAX_EPHEMERAL_BYOK_STRING = 16 * 1024;
++const MAX_EPHEMERAL_BYOK_REASONING_EFFORTS = 64;
++const EPHEMERAL_BYOK_MODEL_KEYS = new Set([
++	'vendor', 'id', 'name', 'modelIdentifier', 'maxContextWindowTokens', 'maxPromptTokens', 'maxOutputTokens',
++	'supportsVision', 'supportedReasoningEfforts', 'defaultReasoningEffort', 'directProvider',
++]);
++const EPHEMERAL_BYOK_PROVIDER_KEYS = new Set(['name', 'type', 'wireApi', 'baseUrl', 'apiKey', 'modelId']);
 +
 +function isBoundedString(value: unknown, optional = false): value is string | undefined {
 +	return (optional && value === undefined) || (typeof value === 'string' && value.length <= MAX_EPHEMERAL_BYOK_STRING);
 +}
 +
-+function isStringRecord(value: unknown): value is Readonly<Record<string, string>> {
-+	return typeof value === 'object' && value !== null && !Array.isArray(value)
-+		&& Object.entries(value).every(([key, entry]) => key.length <= 1024 && isBoundedString(entry));
++function isOptionalTokenCount(value: unknown): boolean {
++	return value === undefined || (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0);
++}
++
++function isOptionalBoolean(value: unknown): boolean {
++	return value === undefined || typeof value === 'boolean';
++}
++
++function hasOnlyKeys(value: Record<string, unknown>, allowed: ReadonlySet<string>): boolean {
++	return Object.keys(value).every(key => allowed.has(key));
++}
++
++function isOptionalReasoningEfforts(value: unknown): boolean {
++	return value === undefined || (Array.isArray(value)
++		&& value.length <= MAX_EPHEMERAL_BYOK_REASONING_EFFORTS
++		&& value.every(entry => isBoundedString(entry)));
 +}
 +
 +/** Validate the private, credential-bearing BYOK handoff before it reaches host memory. */
@@ -536,37 +549,44 @@ index 8f6466a1ef8..9c009a7c41c 100644
 +			return false;
 +		}
 +		const candidate = model as Record<string, unknown>;
-+		if (!isBoundedString(candidate.vendor) || !isBoundedString(candidate.id)) {
++		if (!hasOnlyKeys(candidate, EPHEMERAL_BYOK_MODEL_KEYS)
++			|| !isBoundedString(candidate.vendor)
++			|| !isBoundedString(candidate.id)
++			|| !isBoundedString(candidate.name, true)
++			|| !isBoundedString(candidate.modelIdentifier, true)
++			|| !isOptionalTokenCount(candidate.maxContextWindowTokens)
++			|| !isOptionalTokenCount(candidate.maxPromptTokens)
++			|| !isOptionalTokenCount(candidate.maxOutputTokens)
++			|| !isOptionalBoolean(candidate.supportsVision)
++			|| !isOptionalReasoningEfforts(candidate.supportedReasoningEfforts)
++			|| !isBoundedString(candidate.defaultReasoningEffort, true)) {
 +			return false;
 +		}
++
 +		const direct = candidate.directProvider;
 +		if (typeof direct !== 'object' || direct === null || Array.isArray(direct)) {
 +			return false;
 +		}
 +		const provider = direct as Record<string, unknown>;
-+		if (!isBoundedString(provider.name) || !isBoundedString(provider.baseUrl) || !isBoundedString(provider.modelId)) {
++		if (!hasOnlyKeys(provider, EPHEMERAL_BYOK_PROVIDER_KEYS)
++			|| !isBoundedString(provider.name)
++			|| (provider.name as string).includes('/')
++			|| !isBoundedString(provider.baseUrl)
++			|| !isBoundedString(provider.modelId)
++			|| !isBoundedString(provider.apiKey, true)) {
 +			return false;
 +		}
-+		if (!['openai', 'azure', 'anthropic'].includes(String(provider.type))) {
++		if (provider.type !== 'openai' && provider.type !== 'anthropic') {
 +			return false;
 +		}
-+		if (provider.wireApi !== undefined && !['completions', 'responses'].includes(String(provider.wireApi))) {
-+			return false;
-+		}
-+		if (!isBoundedString(provider.apiKey, true) || !isBoundedString(provider.bearerToken, true)) {
-+			return false;
-+		}
-+		if (provider.headers !== undefined && !isStringRecord(provider.headers)) {
-+			return false;
-+		}
-+		return true;
++		return provider.wireApi === undefined || provider.wireApi === 'completions' || provider.wireApi === 'responses';
 +	});
 +}
 +
  /**
   * Methods handled by the request dispatcher. Excludes `initialize`,
   * `reconnect`, and `ping`, which are handled directly during message
-@@ -523,6 +573,21 @@ export class ProtocolServerHandler extends Disposable implements IAgentHostClien
+@@ -523,6 +599,21 @@ export class ProtocolServerHandler extends Disposable implements IAgentHostClien
  					}
  					return;
  				}
@@ -721,7 +741,7 @@ index b1de0c2fa19..840d0f249d5 100644
  		const registry = new ByokLmBridgeRegistry();
  		const only = pushable();
 diff --git code-server.orig/lib/vscode/src/vs/platform/agentHost/test/node/copilotSessionLauncher.test.ts code-server/lib/vscode/src/vs/platform/agentHost/test/node/copilotSessionLauncher.test.ts
-index 730fc18ab32..8f52fe7b0e6 100644
+index 730fc18ab32..c70eb09941b 100644
 --- code-server.orig/lib/vscode/src/vs/platform/agentHost/test/node/copilotSessionLauncher.test.ts
 +++ code-server/lib/vscode/src/vs/platform/agentHost/test/node/copilotSessionLauncher.test.ts
 @@ -417,6 +417,45 @@ suite('resolveByokSessionConfig', () => {
@@ -771,7 +791,7 @@ index 730fc18ab32..8f52fe7b0e6 100644
  		const registry = new ByokLmBridgeRegistry();
  		const registration = registry.register('client-1', connectionOf([
 diff --git code-server.orig/lib/vscode/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts code-server/lib/vscode/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts
-index c8251749380..b73d339440d 100644
+index c8251749380..eed9360ab6a 100644
 --- code-server.orig/lib/vscode/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts
 +++ code-server/lib/vscode/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts
 @@ -22,6 +22,7 @@ import { NullTelemetryService } from '../../../telemetry/common/telemetryUtils.j
@@ -801,7 +821,7 @@ index c8251749380..b73d339440d 100644
  	dispatchAction(channel: string, action: SessionAction | ChatAction | TerminalAction | ClientChangesetAction | ClientAnnotationsAction | IRootConfigChangedAction | ClientAutomationAction | ClientAutomationRunAction, clientId: string, clientSeq: number, clientContext?: IAgentHostClientTelemetryContext): void {
  		this.handledActions.push(action);
  		this.handledClientTypes.push(clientContext?.clientType);
-@@ -4461,6 +4467,50 @@ suite('ProtocolServerHandler', () => {
+@@ -4461,6 +4467,65 @@ suite('ProtocolServerHandler', () => {
  		assert.deepStrictEqual(response.result, agentService.managedSettingsDiagnostics);
  	});
  
@@ -820,7 +840,6 @@ index c8251749380..b73d339440d 100644
 +				wireApi: 'completions',
 +				baseUrl: 'https://example.invalid/v1',
 +				apiKey: secret,
-+				headers: { 'x-provider-test': 'ok' },
 +				modelId: 'fixture-model',
 +			},
 +		};
@@ -840,6 +859,22 @@ index c8251749380..b73d339440d 100644
 +		transport.simulateMessage(notification('syncEphemeralByokModels', {
 +			channel: 'ahp-root://',
 +			models: [{ vendor: 'customendpoint', id: 'missing-direct-provider' }],
++		}));
++		transport.simulateMessage(notification('syncEphemeralByokModels', {
++			channel: 'ahp-root://',
++			models: [{ ...valid, name: 'x'.repeat(16 * 1024 + 1) }],
++		}));
++		transport.simulateMessage(notification('syncEphemeralByokModels', {
++			channel: 'ahp-root://',
++			models: [{ ...valid, maxPromptTokens: Number.POSITIVE_INFINITY }],
++		}));
++		transport.simulateMessage(notification('syncEphemeralByokModels', {
++			channel: 'ahp-root://',
++			models: [{ ...valid, supportedReasoningEfforts: Array.from({ length: 65 }, () => 'low') }],
++		}));
++		transport.simulateMessage(notification('syncEphemeralByokModels', {
++			channel: 'ahp-root://',
++			models: [{ ...valid, directProvider: { ...valid.directProvider!, bearerToken: 'unsupported-extra-secret' } }],
 +		}));
 +		await Promise.resolve();
 +
@@ -920,7 +955,7 @@ index 15df604bd9f..28397566410 100644
  registerWorkbenchContribution2(AgentHostLegacyMigrationGateContribution.ID, AgentHostLegacyMigrationGateContribution, WorkbenchPhase.BlockStartup);
  registerWorkbenchContribution2(CopilotConfigSlashSubmitHandlerContribution.ID, CopilotConfigSlashSubmitHandlerContribution, WorkbenchPhase.AfterRestored);
 diff --git code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostByokLmHandler.ts code-server/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostByokLmHandler.ts
-index 29c36d99b7d..f2600020659 100644
+index 29c36d99b7d..337b4a9d130 100644
 --- code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostByokLmHandler.ts
 +++ code-server/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostByokLmHandler.ts
 @@ -6,6 +6,7 @@
@@ -939,7 +974,7 @@ index 29c36d99b7d..f2600020659 100644
  	IByokLmModelInfo,
  	IByokLmOutputItem,
  	IByokLmReasoningItem,
-@@ -39,6 +41,102 @@ const REASONING_METADATA_PREFIX = 'vscode-reasoning-metadata:';
+@@ -39,6 +41,104 @@ const REASONING_METADATA_PREFIX = 'vscode-reasoning-metadata:';
  const VSCODE_REASONING_SUMMARY_PART_DONE = 'vscode_reasoning_summary_part_done';
  const CLIENT_BYOK_CONTEXT_KEYS = new Set([ChatEntitlementContextKeys.clientByokEnabled.key]);
  
@@ -948,14 +983,6 @@ index 29c36d99b7d..f2600020659 100644
 +
 +function asRecord(value: unknown): Record<string, unknown> | undefined {
 +	return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
-+}
-+
-+function asStringRecord(value: unknown): Record<string, string> | undefined {
-+	const record = asRecord(value);
-+	if (!record || !Object.values(record).every(candidate => typeof candidate === 'string')) {
-+		return undefined;
-+	}
-+	return record as Record<string, string>;
 +}
 +
 +function providerName(vendor: string, identifier: string): string {
@@ -986,13 +1013,21 @@ index 29c36d99b7d..f2600020659 100644
 +	return { baseUrl: trimEndpointPath(normalized, wireApi), type: 'openai', wireApi };
 +}
 +
-+function replaceApiKey(headers: Record<string, string> | undefined, apiKey: string | undefined): Record<string, string> | undefined {
-+	if (!headers) {
-+		return undefined;
++function hasUnsupportedDirectModelSemantics(model: Record<string, unknown> | undefined): boolean {
++	if (!model) {
++		return false;
 +	}
-+	return Object.fromEntries(Object.entries(headers).map(([key, value]) => [key, apiKey ? value.split('${apiKey}').join(apiKey) : value]));
++	const modelOptions = asRecord(model.modelOptions);
++	const requestHeaders = asRecord(model.requestHeaders);
++	return !!(modelOptions && Object.keys(modelOptions).length > 0)
++		|| !!(requestHeaders && Object.keys(requestHeaders).length > 0)
++		|| model.zeroDataRetentionEnabled === true
++		|| model.adaptiveThinking === true
++		|| typeof model.minThinkingBudget === 'number'
++		|| typeof model.maxThinkingBudget === 'number'
++		|| model.streaming === false
++		|| typeof model.reasoningEffortFormat === 'string';
 +}
-+
 +function toDirectProvider(vendor: string, identifier: string, modelId: string, configuration: Record<string, unknown>): IByokLmDirectProviderConfig | undefined {
 +	if (!DIRECT_BYOK_VENDORS.has(vendor)) {
 +		return undefined;
@@ -1000,9 +1035,14 @@ index 29c36d99b7d..f2600020659 100644
 +	const apiKey = typeof configuration.apiKey === 'string' ? configuration.apiKey : undefined;
 +	const name = providerName(vendor, identifier);
 +	if (vendor === 'openai') {
-+		return { name, type: 'openai', wireApi: 'completions', baseUrl: 'https://api.openai.com/v1', apiKey, modelId };
++		return { name, type: 'openai', wireApi: 'responses', baseUrl: 'https://api.openai.com/v1', apiKey, modelId };
 +	}
 +	if (vendor === 'openrouter') {
++		// The renderer uses OpenRouter's native Messages API for Anthropic models;
++		// named providers cannot express that OpenAI+Messages combination.
++		if (modelId.startsWith('anthropic/')) {
++			return undefined;
++		}
 +		return { name, type: 'openai', wireApi: 'completions', baseUrl: 'https://openrouter.ai/api/v1', apiKey, modelId };
 +	}
 +	if (vendor === 'xai') {
@@ -1019,22 +1059,19 @@ index 29c36d99b7d..f2600020659 100644
 +	const models = Array.isArray(configuration.models) ? configuration.models : [];
 +	const modelConfiguration = models.map(asRecord).find(model => model?.id === modelId);
 +	const url = typeof modelConfiguration?.url === 'string' ? modelConfiguration.url : typeof configuration.url === 'string' ? configuration.url : undefined;
-+	if (!url) {
++	if (!url || url.includes('?') || url.includes('#') || hasUnsupportedDirectModelSemantics(modelConfiguration)) {
 +		return undefined;
 +	}
 +	const apiType = vendor === 'customendpoint'
 +		? (typeof modelConfiguration?.apiType === 'string' ? modelConfiguration.apiType : configuration.apiType) as 'chat-completions' | 'responses' | 'messages' | undefined
 +		: (url.includes('/responses') ? 'responses' : 'chat-completions');
 +	const resolved = resolveCustomEndpoint(url, apiType);
-+	const headers = replaceApiKey(asStringRecord(modelConfiguration?.requestHeaders), apiKey);
-+	const hasExplicitAuthHeader = headers && Object.keys(headers).some(key => ['authorization', 'api-key', 'x-api-key', 'apikey', 'ocp-apim-subscription-key', 'x-functions-key', 'x-goog-api-key'].includes(key.toLowerCase()));
 +	return {
 +		name,
 +		type: resolved.type,
 +		...(resolved.wireApi ? { wireApi: resolved.wireApi } : {}),
 +		baseUrl: resolved.baseUrl,
-+		...(!hasExplicitAuthHeader && apiKey ? { apiKey } : {}),
-+		...(headers ? { headers } : {}),
++		...(apiKey ? { apiKey } : {}),
 +		modelId,
 +	};
 +}
@@ -1042,7 +1079,7 @@ index 29c36d99b7d..f2600020659 100644
  /**
   * Renderer-side {@link IAgentHostByokLmHandler}. Services BYOK chat requests
   * forwarded by the node agent host's OpenAI proxy by calling the VS Code LM
-@@ -169,6 +267,10 @@ export class AgentHostByokLmHandler extends Disposable implements IAgentHostByok
+@@ -169,6 +269,10 @@ export class AgentHostByokLmHandler extends Disposable implements IAgentHostByok
  			// Only genuine renderer BYOK models — exclude agent-host copies, which
  			// carry a `targetChatSessionType` and would otherwise re-enter the bridge.
  			if (metadata?.isBYOK && !metadata.targetChatSessionType) {
@@ -1053,7 +1090,7 @@ index 29c36d99b7d..f2600020659 100644
  				const reasoningEffortSchema = metadata.configurationSchema?.properties?.reasoningEffort;
  				const supportedReasoningEfforts = reasoningEffortSchema?.enum?.filter((value): value is string => typeof value === 'string');
  				const defaultReasoningEffort = typeof reasoningEffortSchema?.default === 'string' ? reasoningEffortSchema.default : undefined;
-@@ -183,6 +285,7 @@ export class AgentHostByokLmHandler extends Disposable implements IAgentHostByok
+@@ -183,6 +287,7 @@ export class AgentHostByokLmHandler extends Disposable implements IAgentHostByok
  					supportsVision: !!metadata.capabilities?.vision,
  					...(supportedReasoningEfforts?.length ? { supportedReasoningEfforts } : {}),
  					...(defaultReasoningEffort !== undefined ? { defaultReasoningEffort } : {}),
@@ -1109,7 +1146,7 @@ index 00843fbde50..3a7789fafd1 100644
  		return this._modelsGroups.has(vendor);
  	}
 diff --git code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostByokLmHandler.test.ts code-server/lib/vscode/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostByokLmHandler.test.ts
-index 44725d74ab5..a7639008cc4 100644
+index 44725d74ab5..049bc9a3f57 100644
 --- code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostByokLmHandler.test.ts
 +++ code-server/lib/vscode/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostByokLmHandler.test.ts
 @@ -18,7 +18,7 @@ import { IContextKey, IContextKeyService } from '../../../../../../platform/cont
@@ -1140,7 +1177,7 @@ index 44725d74ab5..a7639008cc4 100644
  	override isModelHidden(identifier: string): boolean {
  		return this._isModelHidden(identifier);
  	}
-@@ -197,6 +202,47 @@ suite('AgentHostByokLmHandler', () => {
+@@ -197,6 +202,129 @@ suite('AgentHostByokLmHandler', () => {
  		]);
  	});
  
@@ -1183,6 +1220,88 @@ index 44725d74ab5..a7639008cc4 100644
 +			apiKey: 'ephemeral-secret',
 +			modelId: 'fixture-model',
 +		});
++	});
++
++
++	test('direct OpenAI provider preserves the Responses API used by the source BYOK provider', async () => {
++		const identifier = 'openai/OpenAI/fixture-model';
++		const service = new TestLanguageModelsService(
++			new Map([[identifier, byokModel('openai', 'fixture-model')]]),
++			() => responseOf([]), Event.None, () => false,
++			new Map([[identifier, { name: 'OpenAI', configuration: { apiKey: 'ephemeral-secret' } }]]),
++		);
++		const [model] = await createHandler(service).listModels(CancellationToken.None);
++
++		assert.strictEqual(model.directProvider?.wireApi, 'responses');
++	});
++
++	test('OpenRouter Anthropic models retain the renderer bridge instead of changing Messages API semantics', async () => {
++		const identifier = 'openrouter/OpenRouter/anthropic/fixture-model';
++		const service = new TestLanguageModelsService(
++			new Map([[identifier, byokModel('openrouter', 'anthropic/fixture-model')]]),
++			() => responseOf([]), Event.None, () => false,
++			new Map([[identifier, { name: 'OpenRouter', configuration: { apiKey: 'ephemeral-secret' } }]]),
++		);
++		const [model] = await createHandler(service).listModels(CancellationToken.None);
++
++		assert.strictEqual(model.directProvider, undefined);
++	});
++
++	test('custom endpoints with request headers retain the renderer bridge', async () => {
++		const identifier = 'customendpoint/Test Group/fixture-model';
++		const service = new TestLanguageModelsService(
++			new Map([[identifier, byokModel('customendpoint', 'fixture-model')]]),
++			() => responseOf([]), Event.None, () => false,
++			new Map([[identifier, {
++				name: 'Test Group',
++				configuration: {
++					apiKey: 'backend-secret',
++					models: [{ id: 'fixture-model', url: 'https://gateway.example.test/v1/chat/completions', requestHeaders: { 'Ocp-Apim-Subscription-Key': 'gateway-secret' } }],
++				},
++			}]]),
++		);
++		const [model] = await createHandler(service).listModels(CancellationToken.None);
++
++		assert.strictEqual(model.directProvider, undefined);
++	});
++
++	test('custom endpoints with query-bearing URLs retain the renderer bridge', async () => {
++		const identifier = 'customendpoint/Test Group/fixture-model';
++		const service = new TestLanguageModelsService(
++			new Map([[identifier, byokModel('customendpoint', 'fixture-model')]]),
++			() => responseOf([]), Event.None, () => false,
++			new Map([[identifier, {
++				name: 'Test Group',
++				configuration: {
++					apiKey: 'ephemeral-secret',
++					models: [{ id: 'fixture-model', url: 'https://example.test/v1/chat/completions?api-version=2025-01-01' }],
++				},
++			}]]),
++		);
++		const [model] = await createHandler(service).listModels(CancellationToken.None);
++
++		assert.strictEqual(model.directProvider, undefined);
++	});
++
++	test('custom endpoint advanced semantics retain the renderer bridge when named providers cannot represent them', async () => {
++		const cases: Array<{ name: string; extra: Record<string, unknown> }> = [
++			{ name: 'modelOptions', extra: { modelOptions: { temperature: 0.4 } } },
++			{ name: 'zero data retention', extra: { zeroDataRetentionEnabled: true } },
++			{ name: 'adaptive thinking', extra: { adaptiveThinking: true } },
++			{ name: 'thinking budget', extra: { minThinkingBudget: 1024, maxThinkingBudget: 4096 } },
++			{ name: 'non-streaming', extra: { streaming: false } },
++			{ name: 'reasoning effort format', extra: { reasoningEffortFormat: 'responses' } },
++		];
++		for (const { name, extra } of cases) {
++			const identifier = `customendpoint/Test Group/${name}`;
++			const service = new TestLanguageModelsService(
++				new Map([[identifier, byokModel('customendpoint', name)]]),
++				() => responseOf([]), Event.None, () => false,
++				new Map([[identifier, { name: 'Test Group', configuration: { apiKey: 'ephemeral-secret', models: [{ id: name, url: 'https://example.test/v1/responses', ...extra }] } }]]),
++			);
++			const [model] = await createHandler(service).listModels(CancellationToken.None);
++			assert.strictEqual(model.directProvider, undefined, `${name} must use renderer bridge fallback`);
++		}
 +	});
 +
  	test('listModels excludes hidden BYOK sources and Agent Host copies', async () => {
