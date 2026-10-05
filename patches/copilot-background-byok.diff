@@ -964,15 +964,16 @@ server without a new user message and reconnect to the same progressed session.
  registerWorkbenchContribution2(CopilotConfigSlashSubmitHandlerContribution.ID, CopilotConfigSlashSubmitHandlerContribution, WorkbenchPhase.AfterRestored);
 --- code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostByokLmHandler.ts
 +++ code-server/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostByokLmHandler.ts
-@@ -6,6 +6,7 @@
+@@ -6,7 +6,7 @@
  import { CancellationToken } from '../../../../../../base/common/cancellation.js';
  import { Emitter, Event } from '../../../../../../base/common/event.js';
  import { Disposable } from '../../../../../../base/common/lifecycle.js';
-+import { hash } from '../../../../../../base/common/hash.js';
- import { decodeBase64, VSBuffer } from '../../../../../../base/common/buffer.js';
+-import { decodeBase64, VSBuffer } from '../../../../../../base/common/buffer.js';
++import { decodeBase64, encodeBase64, VSBuffer } from '../../../../../../base/common/buffer.js';
  import {
  	ByokLmImageMimeType,
-@@ -15,6 +16,7 @@
+ 	getByokLmAgentModelId,
+@@ -15,6 +15,7 @@
  	IByokLmChatResult,
  	IByokLmContentPart,
  	IByokLmInputItem,
@@ -980,7 +981,7 @@ server without a new user message and reconnect to the same progressed session.
  	IByokLmModelInfo,
  	IByokLmOutputItem,
  	IByokLmReasoningItem,
-@@ -39,6 +41,109 @@
+@@ -39,6 +40,115 @@
  const VSCODE_REASONING_SUMMARY_PART_DONE = 'vscode_reasoning_summary_part_done';
  const CLIENT_BYOK_CONTEXT_KEYS = new Set([ChatEntitlementContextKeys.clientByokEnabled.key]);
  
@@ -991,8 +992,11 @@ server without a new user message and reconnect to the same progressed session.
 +	return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 +}
 +
-+function providerName(vendor: string, identifier: string): string {
-+	return `vscode-byok-${vendor}-${(hash(identifier) >>> 0).toString(16)}`;
++const MAX_DIRECT_PROVIDER_NAME_LENGTH = 16 * 1024;
++
++function providerName(vendor: string, identifier: string): string | undefined {
++	const name = `vscode-byok-${vendor}-${encodeBase64(VSBuffer.fromString(identifier), false, true)}`;
++	return name.length <= MAX_DIRECT_PROVIDER_NAME_LENGTH ? name : undefined;
 +}
 +
 +function trimEndpointPath(url: string, apiType: 'completions' | 'responses' | 'messages'): string {
@@ -1040,6 +1044,9 @@ server without a new user message and reconnect to the same progressed session.
 +	}
 +	const apiKey = typeof configuration.apiKey === 'string' ? configuration.apiKey : undefined;
 +	const name = providerName(vendor, identifier);
++	if (!name) {
++		return undefined;
++	}
 +	if (vendor === 'openai') {
 +		// Named providers cannot carry OpenAI's ZDR setting, which controls
 +		// Responses API storage/continuation behavior. Preserve it via the renderer.
@@ -1090,7 +1097,7 @@ server without a new user message and reconnect to the same progressed session.
  /**
   * Renderer-side {@link IAgentHostByokLmHandler}. Services BYOK chat requests
   * forwarded by the node agent host's OpenAI proxy by calling the VS Code LM
-@@ -169,6 +274,10 @@
+@@ -169,6 +279,10 @@
  			// Only genuine renderer BYOK models — exclude agent-host copies, which
  			// carry a `targetChatSessionType` and would otherwise re-enter the bridge.
  			if (metadata?.isBYOK && !metadata.targetChatSessionType) {
@@ -1101,7 +1108,7 @@ server without a new user message and reconnect to the same progressed session.
  				const reasoningEffortSchema = metadata.configurationSchema?.properties?.reasoningEffort;
  				const supportedReasoningEfforts = reasoningEffortSchema?.enum?.filter((value): value is string => typeof value === 'string');
  				const defaultReasoningEffort = typeof reasoningEffortSchema?.default === 'string' ? reasoningEffortSchema.default : undefined;
-@@ -183,6 +292,7 @@
+@@ -183,6 +297,7 @@
  					supportsVision: !!metadata.capabilities?.vision,
  					...(supportedReasoningEfforts?.length ? { supportedReasoningEfforts } : {}),
  					...(defaultReasoningEffort !== undefined ? { defaultReasoningEffort } : {}),
@@ -1184,7 +1191,7 @@ server without a new user message and reconnect to the same progressed session.
  	override isModelHidden(identifier: string): boolean {
  		return this._isModelHidden(identifier);
  	}
-@@ -197,6 +202,141 @@
+@@ -197,6 +202,163 @@
  		]);
  	});
  
@@ -1229,6 +1236,28 @@ server without a new user message and reconnect to the same progressed session.
 +		});
 +	});
 +
++
++	test('direct provider names do not collide for distinct grouped model identifiers', async () => {
++		// VS Code's 32-bit string hash collides for `Aa` and `BB`. Provider names
++		// are credential routing identities, so they must preserve full group identity.
++		const first = 'customendpoint/Aa/fixture-model';
++		const second = 'customendpoint/BB/fixture-model';
++		const service = new TestLanguageModelsService(
++			new Map([
++				[first, byokModel('customendpoint', 'fixture-model')],
++				[second, byokModel('customendpoint', 'fixture-model')],
++			]),
++			() => responseOf([]), Event.None, () => false,
++			new Map([
++				[first, { name: 'Aa', configuration: { apiKey: 'key-a', models: [{ id: 'fixture-model', url: 'https://a.example.test/v1/responses', apiType: 'responses' }] } }],
++				[second, { name: 'BB', configuration: { apiKey: 'key-b', models: [{ id: 'fixture-model', url: 'https://b.example.test/v1/responses', apiType: 'responses' }] } }],
++			]),
++		);
++		const models = await createHandler(service).listModels(CancellationToken.None);
++
++		assert.strictEqual(models.length, 2);
++		assert.notStrictEqual(models[0].directProvider?.name, models[1].directProvider?.name);
++	});
 +
 +	test('direct OpenAI provider preserves the Responses API used by the source BYOK provider', async () => {
 +		const identifier = 'openai/OpenAI/fixture-model';
