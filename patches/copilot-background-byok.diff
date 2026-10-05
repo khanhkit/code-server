@@ -343,7 +343,24 @@ server without a new user message and reconnect to the same progressed session.
  import { AgentHostByokModelsEnabledConfigKey, AgentHostMcpConnectorsEnabledConfigKey, AgentHostSessionSyncEnabledConfigKey, platformRootSchema, type AgentHostMcpServers } from '../../common/agentHostSchema.js';
  import { CopilotCliConfigKey, copilotCliConfigSchema, normalizeModelFamilyAlias, normalizeToolSearchDeferThreshold, resolveModelCapabilityOverrideField } from '../../common/copilotCliConfig.js';
  import { IAgentHostOTelService } from '../../common/otel/agentHostOTelService.js';
-@@ -549,60 +549,91 @@
+@@ -543,66 +543,114 @@
+  * unit-testable without instantiating the launcher; the launcher passes a
+  * `startProxy` thunk that memoizes the single shared proxy handle.
+  */
++function getByokModelCapabilities(model: IByokLmModelInfo): ModelCapabilitiesOverride | undefined {
++	const supports: NonNullable<ModelCapabilitiesOverride['supports']> = {};
++	if (model.supportsVision !== undefined) {
++		supports.vision = model.supportsVision;
++	}
++	if (model.supportedReasoningEfforts?.length) {
++		supports.reasoningEffort = true;
++	}
++	return Object.keys(supports).length ? { supports } : undefined;
++}
++
+ export async function resolveByokSessionConfig(
+ 	sessionId: string,
+ 	bridgeRegistry: IByokLmBridgeRegistry,
  	startProxy: () => Promise<IByokLmProxyHandle>,
  	logService: ILogService,
  ): Promise<{ providers?: NamedProviderConfig[]; models?: ProviderModelConfig[] }> {
@@ -412,6 +429,7 @@ server without a new user message and reconnect to the same progressed session.
 +				...(direct.apiKey !== undefined ? { apiKey: direct.apiKey } : {}),
 +			});
 +		}
++		const capabilities = getByokModelCapabilities(model);
 +		models.push({
 +			id: direct.modelId,
 +			provider: direct.name,
@@ -419,6 +437,7 @@ server without a new user message and reconnect to the same progressed session.
 +			...(model.maxContextWindowTokens !== undefined ? { maxContextWindowTokens: model.maxContextWindowTokens } : {}),
 +			...(model.maxPromptTokens !== undefined ? { maxPromptTokens: model.maxPromptTokens } : {}),
 +			...(model.maxOutputTokens !== undefined ? { maxOutputTokens: model.maxOutputTokens } : {}),
++			...(capabilities ? { capabilities } : {}),
 +		});
 +	}
 +
@@ -440,14 +459,18 @@ server without a new user message and reconnect to the same progressed session.
 +			baseUrl: handle.providerBaseUrl(vendor),
 +			bearerToken: `${handle.nonce}.${sessionId}`,
 +		})));
-+		models.push(...bridgedModels.map(model => ({
-+			id: getByokLmSelectionModelId(model),
-+			provider: model.vendor,
-+			...(model.name !== undefined ? { name: model.name } : {}),
-+			...(model.maxContextWindowTokens !== undefined ? { maxContextWindowTokens: model.maxContextWindowTokens } : {}),
-+			...(model.maxPromptTokens !== undefined ? { maxPromptTokens: model.maxPromptTokens } : {}),
-+			...(model.maxOutputTokens !== undefined ? { maxOutputTokens: model.maxOutputTokens } : {}),
-+		})));
++		models.push(...bridgedModels.map(model => {
++			const capabilities = getByokModelCapabilities(model);
++			return {
++				id: getByokLmSelectionModelId(model),
++				provider: model.vendor,
++				...(model.name !== undefined ? { name: model.name } : {}),
++				...(model.maxContextWindowTokens !== undefined ? { maxContextWindowTokens: model.maxContextWindowTokens } : {}),
++				...(model.maxPromptTokens !== undefined ? { maxPromptTokens: model.maxPromptTokens } : {}),
++				...(model.maxOutputTokens !== undefined ? { maxOutputTokens: model.maxOutputTokens } : {}),
++				...(capabilities ? { capabilities } : {}),
++			};
++		}));
  	}
 -	const providers: NamedProviderConfig[] = [...new Set(byokModels.map(m => m.vendor))].map(vendor => ({
 -		name: vendor,
@@ -716,7 +739,7 @@ server without a new user message and reconnect to the same progressed session.
  		const only = pushable();
 --- code-server.orig/lib/vscode/src/vs/platform/agentHost/test/node/copilotSessionLauncher.test.ts
 +++ code-server/lib/vscode/src/vs/platform/agentHost/test/node/copilotSessionLauncher.test.ts
-@@ -417,6 +417,45 @@
+@@ -417,10 +417,52 @@
  		assert.strictEqual(proxy.starts, 0);
  	});
  
@@ -728,6 +751,8 @@ server without a new user message and reconnect to the same progressed session.
 +			id: 'fixture-model',
 +			name: 'Fixture Model',
 +			maxContextWindowTokens: 128000,
++			supportsVision: true,
++			supportedReasoningEfforts: ['low', 'high'],
 +			directProvider: {
 +				name: 'vscode-byok-customendpoint-abc',
 +				type: 'openai',
@@ -755,6 +780,7 @@ server without a new user message and reconnect to the same progressed session.
 +				provider: 'vscode-byok-customendpoint-abc',
 +				name: 'Fixture Model',
 +				maxContextWindowTokens: 128000,
++				capabilities: { supports: { vision: true, reasoningEffort: true } },
 +			}],
 +		});
 +	});
@@ -762,6 +788,20 @@ server without a new user message and reconnect to the same progressed session.
  	test('synthesizes deduped providers and per-model config from the active bridge', async () => {
  		const registry = new ByokLmBridgeRegistry();
  		const registration = registry.register('client-1', connectionOf([
+-			{ vendor: 'acme', id: 'claude', name: 'Acme Claude', maxContextWindowTokens: 200000, maxPromptTokens: 32000, maxOutputTokens: 4000 },
++			{ vendor: 'acme', id: 'claude', name: 'Acme Claude', maxContextWindowTokens: 200000, maxPromptTokens: 32000, maxOutputTokens: 4000, supportsVision: true, supportedReasoningEfforts: ['low'] },
+ 			{ vendor: 'acme', id: 'gpt', name: undefined, maxContextWindowTokens: undefined },
+ 			{ vendor: 'globex', id: 'llama', name: 'Globex Llama' },
+ 		]));
+@@ -436,7 +478,7 @@
+ 				{ name: 'globex', type: 'openai', wireApi: 'responses', baseUrl: 'http://127.0.0.1:1/v/globex', bearerToken: 'NONCE.sess-1' },
+ 			],
+ 			models: [
+-				{ id: 'claude', provider: 'acme', name: 'Acme Claude', maxContextWindowTokens: 200000, maxPromptTokens: 32000, maxOutputTokens: 4000 },
++				{ id: 'claude', provider: 'acme', name: 'Acme Claude', maxContextWindowTokens: 200000, maxPromptTokens: 32000, maxOutputTokens: 4000, capabilities: { supports: { vision: true, reasoningEffort: true } } },
+ 				{ id: 'gpt', provider: 'acme' },
+ 				{ id: 'llama', provider: 'globex', name: 'Globex Llama' },
+ 			],
 --- code-server.orig/lib/vscode/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts
 +++ code-server/lib/vscode/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts
 @@ -22,6 +22,7 @@
