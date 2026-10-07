@@ -11,12 +11,13 @@
  import { supportsAgentHostArtifactRemoval } from '../../../../../../platform/agentHost/common/meta/agentHostArtifactRemovalMeta.js';
  import { observableFromSubscription } from '../../../../../../platform/agentHost/common/state/agentSubscription.js';
  import { Changeset, ChangesetState, ChangesetStatus, ChatOriginKind, ChatState, DEFAULT_CHAT_ID, getSessionChatResource, getSessionRelatedPullRequestUrls, isSubagentChatUri, parseChatUri, readSessionFolderGitHubState, readSessionGitHubState, SessionState, SessionSummaryMeta, StateComponents } from '../../../../../../platform/agentHost/common/state/sessionState.js';
-@@ -571,12 +572,13 @@
+@@ -571,12 +572,14 @@
  			const session = sessionState.read(reader);
  			const resolvedCatalogue = resolveChatChangesetCatalogue(chat.toString(), chatState.read(reader)?.changesets, session?.changesets, session?.defaultChat);
  			const selectableEntries = resolvedCatalogue?.filter(({ changeset }) => !changeset.uriTemplate.includes('{'));
 -			const selectedChangeset = selectDefaultChangeset(selectableEntries?.map(({ changeset }) => changeset), currentResolution.defaultChangesetKind);
-+			const defaultChangesetKind = currentResolution.defaultChangesetKind ?? (session?.config?.values[SessionConfigKey.Isolation] === 'worktree' ? ChangesetKind.Branch : ChangesetKind.Session);
++			const isolation = session?.config?.values[SessionConfigKey.Isolation];
++			const defaultChangesetKind = currentResolution.defaultChangesetKind ?? (isolation === 'folder' ? ChangesetKind.Session : isolation === 'worktree' ? ChangesetKind.Branch : undefined);
 +			const selectedChangeset = selectDefaultChangeset(selectableEntries?.map(({ changeset }) => changeset), defaultChangesetKind);
  			const selectedEntry = selectableEntries?.find(({ changeset }) => changeset === selectedChangeset);
  			return resolveAgentHostChangeset(
