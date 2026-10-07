@@ -364,7 +364,7 @@ server without a new user message and reconnect to the same progressed session.
   * `startProxy` thunk that memoizes the single shared proxy handle.
   */
 +function getByokModelCapabilities(model: IByokLmModelInfo): ModelCapabilitiesOverride | undefined {
-+	const supports: NonNullable<ModelCapabilitiesOverride['supports']> = {};
++	const supports: NonNullable<ModelCapabilitiesOverride['supports']> & { toolCalls?: boolean } = {};
 +	if (model.supportsVision !== undefined) {
 +		supports.vision = model.supportsVision;
 +	}
