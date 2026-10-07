@@ -1,0 +1,93 @@
+--- code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionInputPills.ts
++++ code-server/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSessionInputPills.ts
+@@ -19,8 +19,9 @@
+ import { localize } from '../../../../../../nls.js';
+ import { IAgentHostConnectionsService, IAgentHostSessionResolution } from '../../../../../../platform/agentHost/common/agentHostConnectionsService.js';
+ import { toAgentHostUri } from '../../../../../../platform/agentHost/common/agentHostUri.js';
+-import { resolveChangesetUriTemplate, resolveChatChangesetCatalogue, selectDefaultChangeset, type DefaultChangesetKind } from '../../../../../../platform/agentHost/common/changesetUri.js';
++import { ChangesetKind, resolveChangesetUriTemplate, resolveChatChangesetCatalogue, selectDefaultChangeset, type DefaultChangesetKind } from '../../../../../../platform/agentHost/common/changesetUri.js';
+ import { ISessionArtifact, isGitHubArtifactLink, readSessionArtifactsNewestFirst, SessionArtifactType } from '../../../../../../platform/agentHost/common/sessionArtifacts.js';
++import { SessionConfigKey } from '../../../../../../platform/agentHost/common/sessionConfigKeys.js';
+ import { supportsAgentHostArtifactRemoval } from '../../../../../../platform/agentHost/common/meta/agentHostArtifactRemovalMeta.js';
+ import { observableFromSubscription } from '../../../../../../platform/agentHost/common/state/agentSubscription.js';
+ import { Changeset, ChangesetState, ChangesetStatus, ChatOriginKind, ChatState, DEFAULT_CHAT_ID, getSessionChatResource, getSessionRelatedPullRequestUrls, isSubagentChatUri, parseChatUri, readSessionFolderGitHubState, readSessionGitHubState, SessionState, SessionSummaryMeta, StateComponents } from '../../../../../../platform/agentHost/common/state/sessionState.js';
+@@ -571,12 +572,13 @@
+ 			const session = sessionState.read(reader);
+ 			const resolvedCatalogue = resolveChatChangesetCatalogue(chat.toString(), chatState.read(reader)?.changesets, session?.changesets, session?.defaultChat);
+ 			const selectableEntries = resolvedCatalogue?.filter(({ changeset }) => !changeset.uriTemplate.includes('{'));
+-			const selectedChangeset = selectDefaultChangeset(selectableEntries?.map(({ changeset }) => changeset), currentResolution.defaultChangesetKind);
++			const defaultChangesetKind = currentResolution.defaultChangesetKind ?? (session?.config?.values[SessionConfigKey.Isolation] === 'worktree' ? ChangesetKind.Branch : ChangesetKind.Session);
++			const selectedChangeset = selectDefaultChangeset(selectableEntries?.map(({ changeset }) => changeset), defaultChangesetKind);
+ 			const selectedEntry = selectableEntries?.find(({ changeset }) => changeset === selectedChangeset);
+ 			return resolveAgentHostChangeset(
+ 				selectedEntry?.owner === 'session' ? currentResolution.backendSession : chat,
+ 				selectedChangeset ? [selectedChangeset] : undefined,
+-				currentResolution.defaultChangesetKind,
++				defaultChangesetKind,
+ 			);
+ 		});
+ 		const changesetStateSource = derived(this, reader => {
+--- code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/test/browser/agentHost/agentHostSessionInputPills.test.ts
++++ code-server/lib/vscode/src/vs/workbench/contrib/chat/test/browser/agentHost/agentHostSessionInputPills.test.ts
+@@ -681,6 +681,61 @@
+ 		});
+ 	});
+ 
++	test('folder sessions default the Changes pill to Session Changes when the provider has no override', () => {
++		const instantiationService = createInstantiationService();
++		const sessionResource = URI.parse('agent-host-copilot:/session');
++		const backendSession = URI.parse('copilot:/session');
++		const backendChat = URI.parse(buildDefaultChatUri(backendSession));
++		const connection = new StaticAgentConnection(new Map<StateComponents, SessionState | ChatState | ChangesetState>([
++			[StateComponents.Session, {
++				defaultChat: backendChat.toString(),
++				chats: [],
++				config: { values: { isolation: 'folder' } },
++				changesets: [
++					{ label: 'Branch Changes', uriTemplate: 'changeset/branch', changeKind: ChangesetKind.Branch },
++					{ label: 'Session Changes', uriTemplate: 'changeset/session', changeKind: ChangesetKind.Session },
++				],
++			} as unknown as SessionState],
++			[StateComponents.Chat, {} as ChatState],
++			[StateComponents.Changeset, { status: ChangesetStatus.Ready, files: [] } as unknown as ChangesetState],
++		]));
++		const persistentContent = document.createElement('div');
++		document.body.appendChild(persistentContent);
++		store.add(toDisposable(() => persistentContent.remove()));
++		const widget = upcastPartial<ChatWidget>({
++			inputPart: upcastPartial<ChatInputPart>({
++				persistentContentContainerElement: persistentContent,
++				registerChatPetHorizontalPlatformProvider: () => Disposable.None,
++			}),
++			onDidChangeViewModel: Event.None,
++			viewModel: upcastPartial<ChatViewModel>({ sessionResource }),
++			setPersistentContentHeight: () => { },
++		});
++		const connectionsService = upcastPartial<IAgentHostConnectionsService>({
++			onDidChangeConnections: Event.None,
++			onDidChangeSessionResolution: Event.None,
++			connections: [],
++			resolveSessionResource: () => ({ connection, connectionAuthority: 'local', backendSession }),
++		});
++		const browserViewService = upcastPartial<IBrowserViewWorkbenchService>({
++			onDidChangeBrowserViews: Event.None,
++			getKnownBrowserViews: () => new Map(),
++		});
++		const visibility = store.add(instantiationService.createInstance(SessionChatPillVisibility));
++		instantiationService.stub(ISessionChatPillVisibilityService, visibility);
++		const [clipboardService, configurationService, editorService, openerService] = instantiationService.invokeFunction(accessor => [
++			accessor.get(IClipboardService), accessor.get(IConfigurationService), accessor.get(IEditorService), accessor.get(IOpenerService),
++		] as const);
++
++		store.add(new AgentHostSessionInputPills(
++			widget, false, connectionsService, browserViewService, clipboardService, configurationService,
++			editorService, instantiationService, openerService, visibility, noProvisionalSessions, labelService, notificationService,
++		));
++
++		const changesetRequest = connection.requested.findLast(request => request.kind === StateComponents.Changeset);
++		assert.strictEqual(changesetRequest?.resource.toString(), `${backendSession.toString()}/changeset/session`);
++	});
++
+ 	test('resolves the configured session changeset and ignores templated entries', () => {
+ 		const backendSession = URI.parse('ahp-session:/session');
+ 		const changesets: readonly Changeset[] = [
