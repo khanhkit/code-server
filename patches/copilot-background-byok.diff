@@ -41,6 +41,7 @@ server without a new user message and reconnect to the same progressed session.
  	dispatch(channel: string, action: SessionAction | ChatAction | TerminalAction | ClientChangesetAction | ClientAnnotationsAction | ClientAutomationAction | ClientAutomationRunAction | IRootConfigChangedAction): void {
  		const seq = this._subscriptionManager.dispatchOptimistic(channel, action);
  		this.dispatchAction(channel, action, this._clientId, seq);
+
 --- code-server.orig/lib/vscode/src/vs/platform/agentHost/common/agentHostByokLm.ts
 +++ code-server/lib/vscode/src/vs/platform/agentHost/common/agentHostByokLm.ts
 @@ -135,6 +135,17 @@
@@ -61,7 +62,13 @@ server without a new user message and reconnect to the same progressed session.
  export interface IByokLmModelInfo {
  	/** Provider/vendor name (the LM API vendor that registered the model). */
  	readonly vendor: string;
-@@ -161,6 +172,11 @@
+@@ -157,10 +168,17 @@
+ 	readonly maxOutputTokens?: number;
+ 	/** Whether the model accepts image inputs, when known. */
+ 	readonly supportsVision?: boolean;
++	/** Whether the model supports canonical tool calling, when known. */
++	readonly supportsToolCalling?: boolean;
+ 	/** Reasoning effort values advertised by the renderer model, when known. */
  	readonly supportedReasoningEfforts?: readonly string[];
  	/** Default reasoning effort advertised by the renderer model, when known. */
  	readonly defaultReasoningEffort?: string;
@@ -73,7 +80,7 @@ server without a new user message and reconnect to the same progressed session.
  }
  
  /**
-@@ -177,7 +193,9 @@
+@@ -177,7 +195,9 @@
  
  /** Returns the provider-qualified model id advertised by the agent host. */
  export function getByokLmAgentModelId(model: IByokLmModelInfo): string {
@@ -84,6 +91,7 @@ server without a new user message and reconnect to the same progressed session.
  }
  
  /** Resolves BYOK enablement and trace context from synchronized root configuration. */
+
 --- code-server.orig/lib/vscode/src/vs/platform/agentHost/common/agentHostEnablementService.ts
 +++ code-server/lib/vscode/src/vs/platform/agentHost/common/agentHostEnablementService.ts
 @@ -51,9 +51,8 @@
@@ -108,6 +116,7 @@ server without a new user message and reconnect to the same progressed session.
  		},
  		'chat.editor.localAgent.enabled': {
  			type: 'boolean',
+
 --- code-server.orig/lib/vscode/src/vs/platform/agentHost/common/agentHostStarter.config.contribution.ts
 +++ code-server/lib/vscode/src/vs/platform/agentHost/common/agentHostStarter.config.contribution.ts
 @@ -279,10 +279,9 @@
@@ -123,6 +132,7 @@ server without a new user message and reconnect to the same progressed session.
  		},
  		[AgentHostCodexAgentEnabledSettingId]: {
  			type: 'boolean',
+
 --- code-server.orig/lib/vscode/src/vs/platform/agentHost/common/agentService.ts
 +++ code-server/lib/vscode/src/vs/platform/agentHost/common/agentService.ts
 @@ -13,6 +13,7 @@
@@ -155,7 +165,7 @@ server without a new user message and reconnect to the same progressed session.
 +
  	/** Restart the agent host process, if this connection owns its lifecycle. */
  	restartAgentHost(): Promise<void>;
- 
+
 --- code-server.orig/lib/vscode/src/vs/platform/agentHost/common/ahpJsonlLogger.ts
 +++ code-server/lib/vscode/src/vs/platform/agentHost/common/ahpJsonlLogger.ts
 @@ -99,7 +99,7 @@
@@ -206,6 +216,7 @@ server without a new user message and reconnect to the same progressed session.
  export function getAhpLogByteLength(text: string): number {
  	return VSBuffer.fromString(text).byteLength;
  }
+
 --- code-server.orig/lib/vscode/src/vs/platform/agentHost/node/agentHostServerMain.ts
 +++ code-server/lib/vscode/src/vs/platform/agentHost/node/agentHostServerMain.ts
 @@ -32,6 +32,7 @@
@@ -233,6 +244,7 @@ server without a new user message and reconnect to the same progressed session.
  	});
  	disposables.add(runtime);
  	const { agentService, instantiationService } = runtime;
+
 --- code-server.orig/lib/vscode/src/vs/platform/agentHost/node/agentService.ts
 +++ code-server/lib/vscode/src/vs/platform/agentHost/node/agentService.ts
 @@ -80,6 +80,8 @@
@@ -271,6 +283,7 @@ server without a new user message and reconnect to the same progressed session.
  	dispatchAction(channel: string, action: SessionAction | ChatAction | TerminalAction | ClientChangesetAction | ClientAnnotationsAction | IRootConfigChangedAction | ClientAutomationAction | ClientAutomationRunAction, clientId: string, clientSeq: number, clientContextOrType: IAgentHostClientTelemetryContext | AgentHostClientType = AgentHostClientType.Unknown): void {
  		const clientContext = typeof clientContextOrType === 'string'
  			? createUnknownAgentHostClientTelemetryContext(clientContextOrType)
+
 --- code-server.orig/lib/vscode/src/vs/platform/agentHost/node/byokLmBridgeRegistry.ts
 +++ code-server/lib/vscode/src/vs/platform/agentHost/node/byokLmBridgeRegistry.ts
 @@ -38,6 +38,9 @@
@@ -315,15 +328,17 @@ server without a new user message and reconnect to the same progressed session.
  	}
  
  	getServingConnection(): IByokLmBridgeConnection | undefined {
-@@ -171,6 +189,7 @@
+@@ -170,7 +188,9 @@
+ 			&& m.maxPromptTokens === n.maxPromptTokens
  			&& m.maxOutputTokens === n.maxOutputTokens
  			&& m.supportsVision === n.supportsVision
++			&& m.supportsToolCalling === n.supportsToolCalling
  			&& m.defaultReasoningEffort === n.defaultReasoningEffort
 +			&& JSON.stringify(m.directProvider) === JSON.stringify(n.directProvider)
  			&& arraysEqual(m.supportedReasoningEfforts, n.supportedReasoningEfforts);
  	});
  }
-@@ -192,6 +211,8 @@
+@@ -192,6 +212,8 @@
  		return Disposable.None;
  	}
  
@@ -332,6 +347,7 @@ server without a new user message and reconnect to the same progressed session.
  	getModels(): readonly IByokLmModelInfo[] {
  		return [];
  	}
+
 --- code-server.orig/lib/vscode/src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts
 +++ code-server/lib/vscode/src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts
 @@ -13,7 +13,7 @@
@@ -343,7 +359,7 @@ server without a new user message and reconnect to the same progressed session.
  import { AgentHostByokModelsEnabledConfigKey, AgentHostMcpConnectorsEnabledConfigKey, AgentHostSessionSyncEnabledConfigKey, platformRootSchema, type AgentHostMcpServers } from '../../common/agentHostSchema.js';
  import { CopilotCliConfigKey, copilotCliConfigSchema, normalizeModelFamilyAlias, normalizeToolSearchDeferThreshold, resolveModelCapabilityOverrideField } from '../../common/copilotCliConfig.js';
  import { IAgentHostOTelService } from '../../common/otel/agentHostOTelService.js';
-@@ -543,66 +543,114 @@
+@@ -543,66 +543,117 @@
   * unit-testable without instantiating the launcher; the launcher passes a
   * `startProxy` thunk that memoizes the single shared proxy handle.
   */
@@ -351,6 +367,9 @@ server without a new user message and reconnect to the same progressed session.
 +	const supports: NonNullable<ModelCapabilitiesOverride['supports']> = {};
 +	if (model.supportsVision !== undefined) {
 +		supports.vision = model.supportsVision;
++	}
++	if (model.supportsToolCalling !== undefined) {
++		supports.toolCalls = model.supportsToolCalling;
 +	}
 +	if (model.supportedReasoningEfforts?.length) {
 +		supports.reasoningEffort = true;
@@ -495,6 +514,7 @@ server without a new user message and reconnect to the same progressed session.
  }
  
  /** Applies sandbox configuration, returning false when the runtime retains its policy after a managed conflict. */
+
 --- code-server.orig/lib/vscode/src/vs/platform/agentHost/node/protocolServerHandler.ts
 +++ code-server/lib/vscode/src/vs/platform/agentHost/node/protocolServerHandler.ts
 @@ -18,6 +18,7 @@
@@ -505,7 +525,7 @@ server without a new user message and reconnect to the same progressed session.
  import { isManagedSettingsPermissions } from '../common/agentHostManagedSettings.js';
  import { isAnnotationsUri } from '../common/annotationsUri.js';
  import { parseChangesetUri } from '../common/changesetUri.js';
-@@ -145,6 +146,81 @@
+@@ -145,6 +146,82 @@
  	return channel;
  }
  
@@ -514,7 +534,7 @@ server without a new user message and reconnect to the same progressed session.
 +const MAX_EPHEMERAL_BYOK_REASONING_EFFORTS = 64;
 +const EPHEMERAL_BYOK_MODEL_KEYS = new Set([
 +	'vendor', 'id', 'name', 'modelIdentifier', 'maxContextWindowTokens', 'maxPromptTokens', 'maxOutputTokens',
-+	'supportsVision', 'supportedReasoningEfforts', 'defaultReasoningEffort', 'directProvider',
++	'supportsVision', 'supportsToolCalling', 'supportedReasoningEfforts', 'defaultReasoningEffort', 'directProvider',
 +]);
 +const EPHEMERAL_BYOK_PROVIDER_KEYS = new Set(['name', 'type', 'wireApi', 'baseUrl', 'apiKey', 'modelId']);
 +
@@ -559,6 +579,7 @@ server without a new user message and reconnect to the same progressed session.
 +			|| !isOptionalTokenCount(candidate.maxPromptTokens)
 +			|| !isOptionalTokenCount(candidate.maxOutputTokens)
 +			|| !isOptionalBoolean(candidate.supportsVision)
++			|| !isOptionalBoolean(candidate.supportsToolCalling)
 +			|| !isOptionalReasoningEfforts(candidate.supportedReasoningEfforts)
 +			|| !isBoundedString(candidate.defaultReasoningEffort, true)) {
 +			return false;
@@ -587,7 +608,7 @@ server without a new user message and reconnect to the same progressed session.
  /**
   * Methods handled by the request dispatcher. Excludes `initialize`,
   * `reconnect`, and `ping`, which are handled directly during message
-@@ -523,6 +599,21 @@
+@@ -523,6 +600,21 @@
  					}
  					return;
  				}
@@ -609,6 +630,7 @@ server without a new user message and reconnect to the same progressed session.
  				// Notification — fire-and-forget
  				switch (msg.method) {
  					case 'unsubscribe':
+
 --- code-server.orig/lib/vscode/src/vs/platform/agentHost/test/common/ahpJsonlLogger.test.ts
 +++ code-server/lib/vscode/src/vs/platform/agentHost/test/common/ahpJsonlLogger.test.ts
 @@ -114,6 +114,58 @@
@@ -670,6 +692,7 @@ server without a new user message and reconnect to the same progressed session.
  	test('rotates JSONL files and keeps bounded history', async () => {
  		const fileService = store.add(new FileService(new NullLogService()));
  		store.add(fileService.registerProvider('file', store.add(new InMemoryFileSystemProvider())));
+
 --- code-server.orig/lib/vscode/src/vs/platform/agentHost/test/node/byokLmBridgeRegistry.test.ts
 +++ code-server/lib/vscode/src/vs/platform/agentHost/test/node/byokLmBridgeRegistry.test.ts
 @@ -59,6 +59,64 @@
@@ -737,9 +760,10 @@ server without a new user message and reconnect to the same progressed session.
  	test('a window that pushes an empty list is still a valid serving target', () => {
  		const registry = new ByokLmBridgeRegistry();
  		const only = pushable();
+
 --- code-server.orig/lib/vscode/src/vs/platform/agentHost/test/node/copilotSessionLauncher.test.ts
 +++ code-server/lib/vscode/src/vs/platform/agentHost/test/node/copilotSessionLauncher.test.ts
-@@ -417,10 +417,52 @@
+@@ -417,10 +417,53 @@
  		assert.strictEqual(proxy.starts, 0);
  	});
  
@@ -752,6 +776,7 @@ server without a new user message and reconnect to the same progressed session.
 +			name: 'Fixture Model',
 +			maxContextWindowTokens: 128000,
 +			supportsVision: true,
++			supportsToolCalling: true,
 +			supportedReasoningEfforts: ['low', 'high'],
 +			directProvider: {
 +				name: 'vscode-byok-customendpoint-abc',
@@ -780,7 +805,7 @@ server without a new user message and reconnect to the same progressed session.
 +				provider: 'vscode-byok-customendpoint-abc',
 +				name: 'Fixture Model',
 +				maxContextWindowTokens: 128000,
-+				capabilities: { supports: { vision: true, reasoningEffort: true } },
++				capabilities: { supports: { vision: true, toolCalls: true, reasoningEffort: true } },
 +			}],
 +		});
 +	});
@@ -793,7 +818,7 @@ server without a new user message and reconnect to the same progressed session.
  			{ vendor: 'acme', id: 'gpt', name: undefined, maxContextWindowTokens: undefined },
  			{ vendor: 'globex', id: 'llama', name: 'Globex Llama' },
  		]));
-@@ -436,7 +478,7 @@
+@@ -436,7 +479,7 @@
  				{ name: 'globex', type: 'openai', wireApi: 'responses', baseUrl: 'http://127.0.0.1:1/v/globex', bearerToken: 'NONCE.sess-1' },
  			],
  			models: [
@@ -802,6 +827,7 @@ server without a new user message and reconnect to the same progressed session.
  				{ id: 'gpt', provider: 'acme' },
  				{ id: 'llama', provider: 'globex', name: 'Globex Llama' },
  			],
+
 --- code-server.orig/lib/vscode/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts
 +++ code-server/lib/vscode/src/vs/platform/agentHost/test/node/protocolServerHandler.test.ts
 @@ -22,6 +22,7 @@
@@ -897,6 +923,7 @@ server without a new user message and reconnect to the same progressed session.
  	test('setClientManagedSettingsPermissions validates and attributes contributions to the connected client', async () => {
  		const transport = connectClient('client-managed-settings-contribution');
  		transport.sent.length = 0;
+
 --- code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHost.contribution.ts
 +++ code-server/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHost.contribution.ts
 @@ -15,9 +15,11 @@
@@ -962,6 +989,7 @@ server without a new user message and reconnect to the same progressed session.
  registerWorkbenchContribution2(AgentHostExistingSessionHarnessPickerEnablement.ID, AgentHostExistingSessionHarnessPickerEnablement, WorkbenchPhase.BlockRestore);
  registerWorkbenchContribution2(AgentHostLegacyMigrationGateContribution.ID, AgentHostLegacyMigrationGateContribution, WorkbenchPhase.BlockStartup);
  registerWorkbenchContribution2(CopilotConfigSlashSubmitHandlerContribution.ID, CopilotConfigSlashSubmitHandlerContribution, WorkbenchPhase.AfterRestored);
+
 --- code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostByokLmHandler.ts
 +++ code-server/lib/vscode/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostByokLmHandler.ts
 @@ -6,7 +6,7 @@
@@ -981,7 +1009,7 @@ server without a new user message and reconnect to the same progressed session.
  	IByokLmModelInfo,
  	IByokLmOutputItem,
  	IByokLmReasoningItem,
-@@ -39,6 +40,115 @@
+@@ -39,6 +40,118 @@
  const VSCODE_REASONING_SUMMARY_PART_DONE = 'vscode_reasoning_summary_part_done';
  const CLIENT_BYOK_CONTEXT_KEYS = new Set([ChatEntitlementContextKeys.clientByokEnabled.key]);
  
@@ -1029,10 +1057,13 @@ server without a new user message and reconnect to the same progressed session.
 +	}
 +	const modelOptions = asRecord(model.modelOptions);
 +	const requestHeaders = asRecord(model.requestHeaders);
++	const editTools = Array.isArray(model.editTools) ? model.editTools : [];
 +	return !!(modelOptions && Object.keys(modelOptions).length > 0)
 +		|| !!(requestHeaders && Object.keys(requestHeaders).length > 0)
 +		|| model.zeroDataRetentionEnabled === true
 +		|| model.adaptiveThinking === true
++		|| model.thinking === true
++		|| editTools.length > 0
 +		|| typeof model.minThinkingBudget === 'number'
 +		|| typeof model.maxThinkingBudget === 'number'
 +		|| model.streaming === false
@@ -1097,7 +1128,7 @@ server without a new user message and reconnect to the same progressed session.
  /**
   * Renderer-side {@link IAgentHostByokLmHandler}. Services BYOK chat requests
   * forwarded by the node agent host's OpenAI proxy by calling the VS Code LM
-@@ -169,6 +279,10 @@
+@@ -169,6 +282,10 @@
  			// Only genuine renderer BYOK models — exclude agent-host copies, which
  			// carry a `targetChatSessionType` and would otherwise re-enter the bridge.
  			if (metadata?.isBYOK && !metadata.targetChatSessionType) {
@@ -1108,14 +1139,18 @@ server without a new user message and reconnect to the same progressed session.
  				const reasoningEffortSchema = metadata.configurationSchema?.properties?.reasoningEffort;
  				const supportedReasoningEfforts = reasoningEffortSchema?.enum?.filter((value): value is string => typeof value === 'string');
  				const defaultReasoningEffort = typeof reasoningEffortSchema?.default === 'string' ? reasoningEffortSchema.default : undefined;
-@@ -183,6 +297,7 @@
+@@ -181,8 +298,10 @@
+ 					maxPromptTokens: metadata.maxInputTokens,
+ 					maxOutputTokens: metadata.maxOutputTokens,
  					supportsVision: !!metadata.capabilities?.vision,
++					...(metadata.capabilities?.toolCalling !== undefined ? { supportsToolCalling: metadata.capabilities.toolCalling } : {}),
  					...(supportedReasoningEfforts?.length ? { supportedReasoningEfforts } : {}),
  					...(defaultReasoningEffort !== undefined ? { defaultReasoningEffort } : {}),
 +					...(directProvider ? { directProvider } : {}),
  				};
  				const agentHostModelIdentifier = `${SessionType.AgentHostCopilot}:${getByokLmAgentModelId(model)}`;
  				if (!this._languageModelsService.isModelHidden(identifier) && !this._languageModelsService.isModelHidden(agentHostModelIdentifier)) {
+
 --- code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/common/languageModels.ts
 +++ code-server/lib/vscode/src/vs/workbench/contrib/chat/common/languageModels.ts
 @@ -560,6 +560,12 @@
@@ -1161,6 +1196,7 @@ server without a new user message and reconnect to the same progressed session.
  	hasResolvedVendor(vendor: string): boolean {
  		return this._modelsGroups.has(vendor);
  	}
+
 --- code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostByokLmHandler.test.ts
 +++ code-server/lib/vscode/src/vs/workbench/contrib/chat/test/browser/agentSessions/agentHostByokLmHandler.test.ts
 @@ -18,7 +18,7 @@
@@ -1191,7 +1227,7 @@ server without a new user message and reconnect to the same progressed session.
  	override isModelHidden(identifier: string): boolean {
  		return this._isModelHidden(identifier);
  	}
-@@ -197,6 +202,163 @@
+@@ -197,6 +202,166 @@
  		]);
  	});
  
@@ -1199,7 +1235,7 @@ server without a new user message and reconnect to the same progressed session.
 +	test('listModels attaches an ephemeral direct OpenAI-compatible provider config', async () => {
 +		const identifier = 'customendpoint/Test Group/fixture-model';
 +		const service = new TestLanguageModelsService(
-+			new Map([[identifier, byokModel('customendpoint', 'fixture-model')]]),
++			new Map([[identifier, byokModel('customendpoint', 'fixture-model', { toolCalling: true })]]),
 +			() => responseOf([]),
 +			Event.None,
 +			() => false,
@@ -1225,6 +1261,7 @@ server without a new user message and reconnect to the same progressed session.
 +
 +		assert.strictEqual(model.vendor, 'customendpoint');
 +		assert.strictEqual(model.id, 'fixture-model');
++		assert.strictEqual(model.supportsToolCalling, true);
 +		assert.ok(model.directProvider?.name.startsWith('vscode-byok-customendpoint-'));
 +		assert.deepStrictEqual({ ...model.directProvider, name: '<stable-synthetic>' }, {
 +			name: '<stable-synthetic>',
@@ -1336,6 +1373,8 @@ server without a new user message and reconnect to the same progressed session.
 +			{ name: 'modelOptions', extra: { modelOptions: { temperature: 0.4 } } },
 +			{ name: 'zero data retention', extra: { zeroDataRetentionEnabled: true } },
 +			{ name: 'adaptive thinking', extra: { adaptiveThinking: true } },
++			{ name: 'thinking mode', extra: { thinking: true } },
++			{ name: 'edit tools', extra: { editTools: ['apply-patch'] } },
 +			{ name: 'thinking budget', extra: { minThinkingBudget: 1024, maxThinkingBudget: 4096 } },
 +			{ name: 'non-streaming', extra: { streaming: false } },
 +			{ name: 'reasoning effort format', extra: { reasoningEffortFormat: 'responses' } },
@@ -1355,6 +1394,7 @@ server without a new user message and reconnect to the same progressed session.
  	test('listModels excludes hidden BYOK sources and Agent Host copies', async () => {
  		const sourceIdentifier = 'openrouter/OpenRouter 2/ai21/jamba-large-1.7';
  		const agentHostIdentifier = `${SessionType.AgentHostCopilot}:openrouter/OpenRouter 2/ai21/jamba-large-1.7`;
+
 --- code-server.orig/lib/vscode/src/vs/workbench/services/agentHost/browser/editorRemoteAgentHostServiceClient.ts
 +++ code-server/lib/vscode/src/vs/workbench/services/agentHost/browser/editorRemoteAgentHostServiceClient.ts
 @@ -21,6 +21,7 @@
