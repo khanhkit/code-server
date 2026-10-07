@@ -30,7 +30,27 @@
  		const changesetStateSource = derived(this, reader => {
 --- code-server.orig/lib/vscode/src/vs/workbench/contrib/chat/test/browser/agentHost/agentHostSessionInputPills.test.ts
 +++ code-server/lib/vscode/src/vs/workbench/contrib/chat/test/browser/agentHost/agentHostSessionInputPills.test.ts
-@@ -681,6 +681,61 @@
+@@ -31,6 +31,8 @@
+ import { IOpenerService } from '../../../../../../platform/opener/common/opener.js';
+ import { ILabelService } from '../../../../../../platform/label/common/label.js';
+ import { workbenchInstantiationService } from '../../../../../test/browser/workbenchTestServices.js';
++import { TestProductService } from '../../../../../test/common/workbenchTestServices.js';
++import { BrowserWorkbenchEnvironmentService } from '../../../../../services/environment/browser/environmentService.js';
+ import { BrowserEditorInput } from '../../../../browserView/common/browserEditorInput.js';
+ import { IBrowserViewModel, IBrowserViewWorkbenchService } from '../../../../browserView/common/browserView.js';
+ import { IEditorService } from '../../../../../services/editor/common/editorService.js';
+@@ -115,7 +117,9 @@
+ 		getUriLabel: (resource, options) => options?.relative ? resource.path.replace(/^\/repo\/?/, '') : resource.fsPath,
+ 	});
+ 	const createInstantiationService = () => {
+-		const instantiationService = workbenchInstantiationService(undefined, store);
++		const instantiationService = workbenchInstantiationService({
++			environmentService: () => new BrowserWorkbenchEnvironmentService('', URI.file('tests').with({ scheme: 'vscode-tests' }), { userDataPath: '/tmp/vscode-tests' }, TestProductService),
++		}, store);
+ 		instantiationService.stub(IGitHubService, upcastPartial<IGitHubService>({
+ 			credentials: upcastPartial<IGitHubService['credentials']>({
+ 				onDidInvalidate: Event.None,
+@@ -681,6 +685,61 @@
  		});
  	});
  
