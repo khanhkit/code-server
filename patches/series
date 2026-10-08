@@ -24,4 +24,6 @@ trusted-domains.diff
 signature-verification.diff
 copilot.diff
 app-name.diff
+copilot-background-byok.diff
+copilot-agenthost-session-changes.diff
 csp-hashes.diff
